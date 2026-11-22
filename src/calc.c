@@ -23,6 +23,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -170,3 +171,37 @@ memsize_t percent_swap_request(memsize_t totalspace, memsize_t freespace,
   return request;
 }
 
+
+/// Upper edge of the free-swap band: max_free, or 1.5 times min_free when zero
+/** The default saturates at LLONG_MAX instead of overflowing. */
+static memsize_t absolute_max_free(memsize_t min_free, memsize_t max_free)
+{
+  if (max_free > 0) return max_free;
+  const memsize_t half = min_free / 2;
+  return (min_free > LLONG_MAX - half) ? LLONG_MAX : min_free + half;
+}
+
+
+memsize_t absolute_swap_request(memsize_t freeswap, memsize_t min_free,
+    memsize_t max_free, bool pressure)
+{
+  if (min_free <= 0) return 0;
+
+  const memsize_t maxfree = absolute_max_free(min_free, max_free);
+  const memsize_t target = min_free + (maxfree - min_free) / 2;
+
+  memsize_t request = 0;
+  if (freeswap < min_free || (pressure && freeswap < target) ||
+      freeswap > maxfree)
+    request = target - freeswap;
+
+  if (pressure && request < 0) request = 0;
+  return request;
+}
+
+
+memsize_t absolute_min_swapfile(memsize_t min_free, memsize_t max_free)
+{
+  if (min_free <= 0) return 0;
+  return (absolute_max_free(min_free, max_free) - min_free) / 2;
+}

@@ -3,6 +3,7 @@
  * calc.c is included directly so that the tests exercise exactly the code that
  * goes into the daemon without exposing an otherwise internal API.
  */
+#include <limits.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -105,6 +106,59 @@ int main(void)
   // The amount agrees with ideal_swapsize().
   CHECK(percent_swap_request(100000, 10000, 10, 20, 60, 30, false) ==
         ideal_swapsize(100000, 10000, 30));
+
+  // ---- Absolute mode: absolute_swap_request(free, min, max, pressure) ----------
+  // Band 6000..8000, target 7000.
+  CHECK(absolute_swap_request(5000, 6000, 8000, false) == 2000);
+  CHECK(absolute_swap_request(0, 6000, 8000, false) == 7000);
+  CHECK(absolute_swap_request(5999, 6000, 8000, false) == 1001);
+  CHECK(absolute_swap_request(6000, 6000, 8000, false) == 0);
+  CHECK(absolute_swap_request(7000, 6000, 8000, false) == 0);
+  CHECK(absolute_swap_request(8000, 6000, 8000, false) == 0);
+  CHECK(absolute_swap_request(8001, 6000, 8000, false) == -1001);
+  CHECK(absolute_swap_request(9000, 6000, 8000, false) == -2000);
+  CHECK(absolute_swap_request(15000, 6000, 8000, false) == -8000);
+  // Under pressure: top up while below the middle, never release.
+  CHECK(absolute_swap_request(6500, 6000, 8000, true) == 500);
+  CHECK(absolute_swap_request(7000, 6000, 8000, true) == 0);
+  CHECK(absolute_swap_request(7500, 6000, 8000, true) == 0);
+  CHECK(absolute_swap_request(9000, 6000, 8000, true) == 0);
+  CHECK(absolute_swap_request(5000, 6000, 8000, true) == 2000);
+  // max_free of zero means 1.5 times min_free (band 6000..9000, target 7500).
+  CHECK(absolute_swap_request(5000, 6000, 0, false) == 2500);
+  CHECK(absolute_swap_request(9000, 6000, 0, false) == 0);
+  CHECK(absolute_swap_request(9001, 6000, 0, false) == -1501);
+  // A zero-width band (max equal to min) steers to that exact value.
+  CHECK(absolute_swap_request(6000, 6000, 6000, false) == 0);
+  CHECK(absolute_swap_request(5999, 6000, 6000, false) == 1);
+  CHECK(absolute_swap_request(6001, 6000, 6000, false) == -1);
+  // Absolute mode off: no request, whatever the free amount.
+  CHECK(absolute_swap_request(0, 0, 0, false) == 0);
+  CHECK(absolute_swap_request(100000, 0, 8000, true) == 0);
+
+  // Huge values: the default maximum saturates instead of overflowing.
+  const memsize_t quarter = LLONG_MAX / 4;
+  CHECK(absolute_swap_request(0, quarter, 0, false) ==
+        quarter + (quarter / 2) / 2);
+  CHECK(absolute_swap_request(quarter, quarter, quarter, false) == 0);
+  CHECK(absolute_swap_request(quarter, quarter, 0, false) == 0);
+  CHECK(absolute_swap_request(quarter + (quarter / 2), quarter, 0, false) == 0);
+  CHECK(absolute_swap_request(quarter + (quarter / 2) + 1, quarter, 0, false) < 0);
+  const memsize_t huge = LLONG_MAX - 10;
+  CHECK(absolute_swap_request(0, huge, 0, false) == huge + 5);
+  CHECK(absolute_swap_request(huge - 1, huge, 0, false) > 0);
+  CHECK(absolute_swap_request(LLONG_MAX, huge, 0, false) == 0);
+  CHECK(absolute_swap_request(huge, LLONG_MAX, LLONG_MAX, false) == 10);
+
+  // ---- absolute_min_swapfile(min, max) ------------------------------------
+  // The gap to the middle of the band: independent of how large min_free is.
+  CHECK(absolute_min_swapfile(6000, 8000) == 1000);
+  CHECK(absolute_min_swapfile(6000, 0) == 1500);
+  CHECK(absolute_min_swapfile(6000, 6000) == 0);
+  CHECK(absolute_min_swapfile(0, 0) == 0);
+  CHECK(absolute_min_swapfile(0, 8000) == 0);
+  CHECK(absolute_min_swapfile(huge, 0) == 5);
+  CHECK(absolute_min_swapfile(quarter, 0) == (quarter / 2) / 2);
 
   if (failures) fprintf(stderr, "%d check(s) failed\n", failures);
   return failures ? 1 : 0;
