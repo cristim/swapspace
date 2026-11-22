@@ -20,7 +20,9 @@ endif
 if NO_CONFIG
 TESTS = test_calc test_crypt test_cryptdev test_swaps
 else
-TESTS = test_calc test_crypt test_cryptdev test_swaps test_cli.sh test_crypt_cli.sh
+TESTS = test_calc test_crypt test_cryptdev test_swaps test_cli.sh test_crypt_cli.sh \
+         test_crypt_root_bin.sh
 endif
 
-EXTRA_DIST = fake_system.h test_cli.sh test_crypt_cli.sh root-integration.sh crypt-root.sh
+EXTRA_DIST = fake_system.h test_cli.sh test_crypt_cli.sh test_crypt_root_bin.sh root-integration.sh \
+             crypt-root.sh

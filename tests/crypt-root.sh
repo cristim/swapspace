@@ -46,8 +46,19 @@
 #
 # Scenarios:
 #  1. allocation: files are created, mapped and enabled; /proc/swaps lists the
-#     mapper devices and never the plain files; the cipher is visible in the
-#     kernel's state
+#     mapper devices and never the plain files; cipher, key size, direct I/O
+#     and random distinct keys are visible in the kernel's state
+#  2. adoption: a restarted daemon adopts the active mappings unchanged
+#  3. confidentiality: a marker written through the mapping does not appear in
+#     the backing file; startup with crypt on removes a leftover mapping and
+#     deletes its file
+#  4. erase with crypt off: -e retires encrypted swapfiles anyway
+#  5. paranoid: stopping the daemon retires everything and leaves nothing
+#  6. fail closed: with a cipher the kernel does not have, no swap is enabled
+#     and nothing is left behind
+#  7. another instance: a second swap directory holding a file with the same
+#     number does not adopt, and does not close, the first one's mapping, in
+#     crypt mode or with crypt off
 
 if [ "${SWAPSPACE_CRYPT_TEST:-0}" != "1" ]; then
   echo "Refusing to run: set SWAPSPACE_CRYPT_TEST=1 (this test activates real" >&2
@@ -383,7 +394,174 @@ check "files exist for each slot" files_exist $slots
 if [ -n "$first" ]; then
   check "dmsetup table shows the cipher" \
     sh -c "dmsetup table swapspace-$first | grep -q 'crypt aes-xts-plain64 '"
+  status=$(cryptsetup status "swapspace-$first" 2>&1)
+  echo "$status" | grep -Eq 'type: +PLAIN' && pass "cryptsetup status: type PLAIN" ||
+    fail "cryptsetup status: type PLAIN"
+  echo "$status" | grep -Eq 'cipher: +aes-xts-plain64' &&
+    pass "cryptsetup status: cipher" || fail "cryptsetup status: cipher"
+  echo "$status" | grep -Eq 'keysize: +512' &&
+    pass "cryptsetup status: key size" || fail "cryptsetup status: key size"
+  loopdev=$(test_loops | sed -n 1p)
+  if [ -n "$loopdev" ]; then
+    dio=$(losetup -l -n -O NAME,DIO | awk -v d="$loopdev" '$1 == d {print $2}')
+    [ "$dio" = "1" ] && pass "loop device uses direct I/O" ||
+      fail "loop device does not use direct I/O (DIO=$dio)"
+    logsec=$(losetup -l -n -O NAME,LOG-SEC 2>/dev/null |
+      awk -v d="$loopdev" '$1 == d {print $2}')
+    echo "info: loop logical block size ${logsec:-unknown}, filesystem block size $(stat -f -c %S "$swapdir")"
+    [ -z "$logsec" ] || [ "$logsec" -ge 512 ] &&
+      pass "loop logical block size is usable" ||
+      fail "loop logical block size is $logsec"
+  else
+    fail "no loop device backed by a file in the test directory"
+  fi
 fi
+
+if [ -n "$first" ] && [ -n "$second" ]; then
+  k1=$(dmsetup table --showkeys "swapspace-$first" | awk '{print $5}')
+  k2=$(dmsetup table --showkeys "swapspace-$second" | awk '{print $5}')
+  if echo "$k1" | grep -Eq '^[0-9a-f]{128}$' &&
+     echo "$k2" | grep -Eq '^[0-9a-f]{128}$'; then
+    zeros=$(printf '0%.0s' $(seq 1 128))
+    [ "$k1" != "$k2" ] && pass "each file has its own key" ||
+      fail "two files share a key"
+    [ "$k1" != "$zeros" ] && [ "$k2" != "$zeros" ] && pass "keys are not zero" ||
+      fail "a key is all zeros"
+  else
+    skip "key comparison: key is not shown as hex by dmsetup here"
+  fi
+  unset k1 k2
+fi
+
+# === 2. adoption ============================================================
+echo "=== 2. adoption ==="
+minor_before=""
+[ -n "$first" ] && minor_before=$(dmsetup info -c --noheadings -o minor "swapspace-$first")
+start_daemon "$base/crypt.conf" "$base/log2"
+sleep 3
+stop_daemon
+check "restarted daemon detects the encrypted swapfile" \
+  grep -q "Detected swapfile '$first'" "$base/log2"
+check "the active mapping was not recreated" \
+  sh -c "[ \"\$(dmsetup info -c --noheadings -o minor swapspace-$first)\" = '$minor_before' ]"
+check "no plain swapfile is listed in /proc/swaps after restart" no_plain_swaps
+
+# === 3. confidentiality and stale mapping ===================================
+echo "=== 3. confidentiality and stale mapping ==="
+if [ -n "$first" ]; then
+  marker="SWAPSPACE-CRYPT-MARKER-$$-$(date +%s)"
+  # A 1 MiB pattern of the marker, written at offset 1 MiB of the device.
+  yes "$marker" | head -c 1048576 >"$base/pattern"
+  check "marker is findable in a plain file (control)" \
+    grep -aqF "$marker" "$base/pattern"
+
+  # Make the mapping a plain block device again: writing into active swap
+  # would corrupt swapped-out pages.
+  if swapoff "/dev/mapper/swapspace-$first"; then
+    dd if="$base/pattern" of="/dev/mapper/swapspace-$first" bs=4096 seek=256 \
+      count=256 oflag=direct 2>/dev/null
+    sync
+    dd if="/dev/mapper/swapspace-$first" bs=4096 skip=256 count=256 \
+      iflag=direct 2>/dev/null | grep -aqF "$marker" &&
+      pass "marker reads back through the mapping" ||
+      fail "marker did not reach the mapping"
+    grep -aqF "$marker" "$swapdir/$first" &&
+      fail "marker found in the backing file: not encrypted" ||
+      pass "marker is absent from the backing file"
+  else
+    fail "could not swapoff slot $first for the marker test"
+  fi
+
+  # Startup with crypt on: the mapping of slot $first is stale (no swap on
+  # it).  It must be removed and its file deleted; the rest is retired by -e.
+  "$BIN" -c "$base/crypt.conf" -e -v >"$base/log3" 2>&1
+  check "-e with crypt on succeeds" [ $? -eq 0 ]
+  check "stale mapping removed" sh -c "! dmsetup info swapspace-$first"
+  check "stale file deleted" not files_exist "$first"
+  wait_for 10 nothing_left
+  check "nothing left behind after -e" nothing_left
+fi
+
+# === 4. erase with crypt off ================================================
+echo "=== 4. erase with crypt off ==="
+start_daemon "$base/crypt.conf" "$base/log4"
+wait_for 40 at_least_slots 1
+stop_daemon
+check "an encrypted swap is active before -e" at_least_slots 1
+"$BIN" -c "$base/plain.conf" -e -v >"$base/log4e" 2>&1
+check "-e with crypt off succeeds" [ $? -eq 0 ]
+wait_for 10 nothing_left
+check "-e retired the encrypted swapfiles and left nothing" nothing_left
+check "no numbered files remain" no_numbered_files
+
+# === 5. paranoid ============================================================
+echo "=== 5. paranoid ==="
+start_daemon "$base/paranoid.conf" "$base/log5"
+wait_for 40 at_least_slots 1
+stop_daemon
+check "paranoid daemon exits with success" [ "$daemon_status" -eq 0 ]
+wait_for 10 nothing_left
+check "paranoid exit retired everything" nothing_left
+check "no numbered files remain" no_numbered_files
+
+# === 6. fail closed =========================================================
+echo "=== 6. fail closed ==="
+start_daemon "$base/badcipher.conf" "$base/log6"
+sleep 8
+check "daemon tried and logged the failure" \
+  grep -q "Could not create encrypted mapping" "$base/log6"
+check "no swap was enabled" no_slots
+check "no plain swapfile was enabled" no_plain_swaps
+stop_daemon
+wait_for 10 nothing_left
+check "nothing left behind after failed setups" nothing_left
+check "no numbered files remain" no_numbered_files
+
+# === 7. another instance ====================================================
+echo "=== 7. another instance ==="
+other="$base/other"
+mkdir "$other" && chmod 700 "$other" || exit 1
+WCDIR=$other write_conf "$base/other.conf" "crypt"
+start_daemon "$base/crypt.conf" "$base/log7a"
+wait_for 40 at_least_slots 1
+stop_daemon
+mine=$(active_slots | sed -n 1p)
+if [ -n "$mine" ]; then
+  # The other instance has a file with the same number, as an earlier run of
+  # its own might have left.  Mapping names are global; this one is not its.
+  dd if=/dev/zero of="$other/$mine" bs=1k count=64 2>/dev/null
+  start_daemon "$base/other.conf" "$base/log7b"
+  sleep 6
+  stop_daemon
+  "$BIN" -c "$base/other.conf" -e -v >"$base/log7c" 2>&1
+  check "other instance did not adopt the mapping" \
+    not grep -q "Detected swapfile '$mine'" "$base/log7b" "$base/log7c"
+  check "the first instance's mapping is still active" \
+    dmsetup info "swapspace-$mine"
+  check "the first instance's swap is still in /proc/swaps" \
+    at_least_slots 1
+  check "the first instance's file is still there" [ -e "$swapdir/$mine" ]
+  check "the other instance's own file is still there" [ -e "$other/$mine" ]
+
+  # A plain (crypt off) instance on a directory with a file of that number must
+  # not close the mapping either: at startup it clears leftovers only if they
+  # sit on its own files.
+  WCDIR=$other write_conf "$base/otherplain.conf"
+  dd if=/dev/zero of="$other/$mine" bs=1k count=64 2>/dev/null
+  start_daemon "$base/otherplain.conf" "$base/log7e"
+  sleep 6
+  stop_daemon
+  "$BIN" -c "$base/otherplain.conf" -e -v >"$base/log7f" 2>&1
+  check "a plain instance left the first instance's mapping alone" \
+    dmsetup info "swapspace-$mine"
+  check "the first instance's swap is still active after the plain run" \
+    at_least_slots 1
+else
+  fail "no encrypted swap to test with"
+fi
+"$BIN" -c "$base/crypt.conf" -e -v >"$base/log7d" 2>&1
+wait_for 10 nothing_left
+check "nothing left behind after scenario 7" nothing_left
 
 echo
 if [ "$failures" -eq 0 ]; then
