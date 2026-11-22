@@ -1,8 +1,9 @@
 AM_CFLAGS = --std=gnu99
-AM_CPPFLAGS = -I$(top_srcdir)/src
+AM_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)/src
 
-check_PROGRAMS = test_calc
+check_PROGRAMS = test_calc test_crypt
 test_calc_SOURCES = test_calc.c
+test_crypt_SOURCES = test_crypt.c
 
 if FUZZING
 check_PROGRAMS += fuzz_meminfo
@@ -15,9 +16,9 @@ fuzz_meminfo_LDADD = $(top_builddir)/src/memory.$(OBJEXT) \
 endif
 
 if NO_CONFIG
-TESTS = test_calc
+TESTS = test_calc test_crypt
 else
-TESTS = test_calc test_cli.sh
+TESTS = test_calc test_crypt test_cli.sh
 endif
 
 EXTRA_DIST = test_cli.sh root-integration.sh
