@@ -45,6 +45,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <linux/magic.h>
 
 #include "calc.h"
+#include "cryptdev.h"
 #include "log.h"
 #include "opts.h"
 #include "state.h"
@@ -418,11 +419,11 @@ memsize_t swapfs_size(void)
  */
 static bool enable_swapfile(const char file[], int *fault)
 {
-  const int mkstatus = runcommand("mkswap", file);
+  const int mkstatus = swapops->mkswap(file);
   if (unlikely(mkstatus != 0))
     logm(LOG_WARNING, "mkswap failed for '%s' (status %d)", file, mkstatus);
 
-  if (unlikely(swapon(file, 0) != 0))
+  if (unlikely(swapops->swapon(file) != 0))
   {
     const int err = errno;
     if (fault) *fault = err;
@@ -903,7 +904,7 @@ static bool retire_swapfile(int file)
 #ifndef NO_CONFIG
   if (!quiet) logm(LOG_NOTICE, "Retiring swapfile '%d'", file);
 #endif
-  if (unlikely(swapoff(namebuf) == -1)) return false;
+  if (unlikely(swapops->swapoff(namebuf) == -1)) return false;
 
 #ifndef NO_CONFIG
   int fd = -1;
