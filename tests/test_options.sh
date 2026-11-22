@@ -43,7 +43,8 @@ else
 fi
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/swapspace-opts.XXXXXX") || exit 1
-trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+DPIDS=
+trap 'test -n "$DPIDS" && kill $DPIDS 2>/dev/null; rm -rf "$TMP"' EXIT HUP INT TERM
 
 set -f
 OUT="$TMP/out"
@@ -770,6 +771,85 @@ for how in -V -h; do
   check "$how after a bad option" "Illegal option: -Z"
   run_split $how -c "$TMP/bad.conf"
   check "$how ignores the configuration file" ok
+done
+
+# Running daemon: -p, --pidfile and pidfile in the file write the process id,
+# -d forks and the parent exits 0 after rewriting the id, and a SIGTERM makes
+# the daemon exit 0 and remove the pidfile.  The thresholds (0, 2, 100, no
+# PSI) keep it from ever wanting swap, so no privileges are needed.
+RUNDIR="$TMP/run-swap"
+mkdir -m 700 "$RUNDIR"
+cat >"$TMP/run.conf" <<EOF
+swappath = "$RUNDIR"
+lower_freelimit = 0
+freetarget = 2
+upper_freelimit = 100
+psi_threshold = 0
+EOF
+PIDF="$TMP/daemon.pid"
+
+# wait_for TEST...: poll up to five seconds for a command to succeed.
+wait_for() {
+  n=0
+  until "$@"; do
+    n=$((n+1))
+    [ "$n" -le 50 ] || return 1
+    sleep 0.1
+  done
+}
+pidfile_ready() { [ -s "$PIDF" ]; }
+pidfile_gone() { [ ! -e "$PIDF" ]; }
+
+# Foreground: the pidfile holds our child's process id.
+for how in "-p $PIDF" "--pidfile=$PIDF"; do
+  rm -f "$PIDF"
+  CASES=$((CASES+1))
+  "$BIN" -c "$TMP/run.conf" -q $how >"$OUT" 2>&1 </dev/null &
+  DPID=$!
+  DPIDS=$DPID
+  if wait_for pidfile_ready; then
+    [ "$(cat "$PIDF")" = "$DPID" ] || bad "$how: pidfile holds '$(cat "$PIDF")', not $DPID"
+  else
+    bad "$how: no pidfile was written: $(head -n 1 "$OUT")"
+  fi
+  kill -TERM "$DPID" 2>/dev/null
+  wait "$DPID"
+  [ $? -eq 0 ] || bad "$how: SIGTERM did not end the daemon with status 0"
+  DPIDS=
+  pidfile_gone || bad "$how: the pidfile was not removed on exit"
+done
+
+# The pidfile can come from the configuration file too.
+cp "$TMP/run.conf" "$TMP/runpid.conf"
+printf 'pidfile = "%s"\n' "$PIDF" >>"$TMP/runpid.conf"
+rm -f "$PIDF"
+CASES=$((CASES+1))
+"$BIN" -c "$TMP/runpid.conf" -q >"$OUT" 2>&1 </dev/null &
+DPID=$!
+DPIDS=$DPID
+wait_for pidfile_ready || bad "pidfile in the configuration file: no pidfile was written"
+[ "$(cat "$PIDF" 2>/dev/null)" = "$DPID" ] || bad "pidfile in the configuration file holds the wrong id"
+kill -TERM "$DPID" 2>/dev/null
+wait "$DPID"
+DPIDS=
+
+# -d: the foreground process exits 0 and the pidfile names the daemon that
+# stays behind.
+for how in "-d" "--daemon"; do
+  rm -f "$PIDF"
+  CASES=$((CASES+1))
+  "$BIN" -c "$TMP/run.conf" -q -p "$PIDF" $how >"$OUT" 2>&1 </dev/null
+  [ $? -eq 0 ] || bad "$how: the foreground process did not exit 0"
+  if pidfile_ready; then
+    DPID=$(cat "$PIDF")
+    DPIDS=$DPID
+    kill -0 "$DPID" 2>/dev/null || bad "$how: pidfile names a process that is not running"
+    kill -TERM "$DPID" 2>/dev/null
+    wait_for pidfile_gone || bad "$how: the pidfile was not removed after SIGTERM"
+    DPIDS=
+  else
+    bad "$how: no pidfile was written"
+  fi
 done
 
 if [ "$FAILS" -ne 0 ]; then
