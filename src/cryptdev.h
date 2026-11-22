@@ -31,6 +31,14 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 /// System operations used for swap activation; replaceable by tests
 struct swap_ops
 {
+  /// Attach file to a free loop device with direct I/O (needs LOOP_CONFIGURE)
+  /** On success *loopno is the device number and *loopfd an open descriptor
+   * for it, to be released with loop_close().  The device detaches itself when
+   * its last user goes away.  Must refuse if direct I/O cannot be enabled.
+   */
+  bool (*loop_attach)(const char file[], int *loopno, int *loopfd);
+  /// Release a descriptor obtained from loop_attach
+  void (*loop_close)(int loopfd);
   /// Run a complete shell command line; returns its exit status or -1
   int (*run)(const char line[]);
   /// Does a device-mapper device swapspace-<seqno> exist?

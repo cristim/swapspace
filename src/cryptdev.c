@@ -18,6 +18,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include "env.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,12 +26,26 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <linux/loop.h>
+#include <linux/stat.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/swap.h>
+#include <sys/syscall.h>
 
 #include "cryptdev.h"
+#include "log.h"
 #include "support.h"
 
+#ifndef O_LARGEFILE
+#define O_LARGEFILE 0
+#endif
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+
+/// How often to retry when another process grabs the free loop device first
+#define LOOP_ATTEMPTS 5
 /// Slot limit for reading mapper names; matches MAX_SWAPFILES in swaps.c
 #define SLOT_LIMIT 32
 
@@ -97,6 +112,188 @@ bool crypt_mapping_exists(int seqno)
 }
 
 
+#ifdef LOOP_CONFIGURE
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+
+/// Direct I/O alignment and preferred I/O size of an open file (0 if unknown)
+/** Direct I/O is only possible if the loop device's logical block size is at
+ * least the backing file's direct I/O offset alignment.  The loop default is
+ * 512 bytes, which makes the kernel refuse direct I/O on 4Kn storage (and on
+ * any filesystem that wants 4096-byte aligned direct I/O).  So ask the
+ * filesystem (statx STATX_DIOALIGN, Linux 6.1), and report the file's
+ * preferred I/O size (the filesystem block size) as the fallback.  Both come
+ * from the descriptor that is bound to the loop device, not from the path, so
+ * they describe the file that is actually used.
+ */
+static void io_hints(int fd, unsigned long *dio_align, unsigned long *blksize)
+{
+  *dio_align = *blksize = 0;
+
+#if defined(SYS_statx) && defined(STATX_DIOALIGN)
+  struct statx stx;
+  if (syscall(SYS_statx, fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) == 0 &&
+      (stx.stx_mask & STATX_DIOALIGN))
+    *dio_align = stx.stx_dio_offset_align;
+#endif
+
+  struct stat st;
+  if (fstat(fd, &st) == 0 && st.st_blksize > 0)
+    *blksize = (unsigned long)st.st_blksize;
+}
+
+
+/// The LOOP_CONFIGURE request: bind fd with direct I/O, autoclear and a block size
+/** The block size comes from the file's alignment hints (see io_hints() and
+ * crypt_loop_blocksize()).  If no block size fits (the direct I/O alignment is
+ * above the page size) nothing is requested and false is returned: the caller
+ * must refuse, since the kernel would take the alignment as the block size.
+ * Swapping over a device whose logical block size is
+ * below the page size is fine: mm/swapfile.c (checked against current
+ * mainline) only rejects zoned devices, and the older kernels that called
+ * set_blocksize(PAGE_SIZE) there needed the block size to be at most the page
+ * size, which crypt_loop_blocksize() guarantees.  It matters on systems with
+ * 16 KiB pages (Asahi): there the block size is 4096.  Swapfile sizes are
+ * multiples of the page size, hence of the block size.
+ */
+static bool loop_request(struct loop_config *cfg, int backing,
+    unsigned long dio_align, unsigned long blksize, unsigned long pagesize)
+{
+  memset(cfg, 0, sizeof(*cfg));
+  cfg->fd = backing;
+  cfg->block_size = crypt_loop_blocksize(dio_align, blksize, pagesize);
+  cfg->info.lo_flags = LO_FLAGS_AUTOCLEAR | LO_FLAGS_DIRECT_IO;
+  return cfg->block_size != 0;
+}
+
+
+/// Did the kernel really enable direct I/O?  It drops the flag silently.
+static bool loop_dio_active(const struct loop_info64 *info)
+{
+  return (info->lo_flags & LO_FLAGS_DIRECT_IO) != 0;
+}
+
+
+/// Attach file to a free loop device with direct I/O.
+/** Needs Linux 5.8 or later (LOOP_CONFIGURE).  Direct I/O is requested in the
+ * same call that binds the file, together with the block size it needs, so the
+ * device never exists in a state where direct I/O is impossible.  The device is
+ * set to autoclear: the kernel detaches it when the last file descriptor or
+ * user (such as a dm-crypt mapping) goes away, so closing *loopfd undoes this
+ * on failure paths.
+ *
+ * @param loopno receives the loop device number
+ * @param loopfd receives an open descriptor for the loop device; the caller
+ * closes it
+ */
+static bool real_loop_attach(const char file[], int *loopno, int *loopfd)
+{
+  const int backing = open(file, O_RDWR|O_CLOEXEC|O_NOFOLLOW|O_LARGEFILE);
+  if (unlikely(backing == -1))
+  {
+    log_perr_str(LOG_ERR, "Could not open swapfile for loop device", file,
+	errno);
+    return false;
+  }
+
+  const int ctl = open("/dev/loop-control", O_RDWR|O_CLOEXEC);
+  if (unlikely(ctl == -1))
+  {
+    log_perr(LOG_ERR, "Could not open /dev/loop-control (is the loop module "
+	"available?)", errno);
+    close(backing);
+    return false;
+  }
+
+  unsigned long dio_align, blksize;
+  io_hints(backing, &dio_align, &blksize);
+
+  bool ok = false;
+  for (int attempt = 0; attempt < LOOP_ATTEMPTS && !ok; ++attempt)
+  {
+    const int n = ioctl(ctl, LOOP_CTL_GET_FREE);
+    if (unlikely(n < 0))
+    {
+      log_perr(LOG_ERR, "Could not get a free loop device", errno);
+      break;
+    }
+
+    char dev[32];
+    if (unlikely(!crypt_loop_path(dev, sizeof(dev), n))) break;
+    const int fd = open(dev, O_RDWR|O_CLOEXEC);
+    if (unlikely(fd == -1))
+    {
+      log_perr_str(LOG_ERR, "Could not open loop device", dev, errno);
+      break;
+    }
+
+    struct loop_config cfg;
+    if (unlikely(!loop_request(&cfg, backing, dio_align, blksize,
+	    (unsigned long)getpagesize())))
+    {
+      logm(LOG_ERR, "Direct I/O alignment %lu of '%s' exceeds the page size; "
+	  "refusing to use crypt mode here", dio_align, file);
+      close(fd);
+      break;
+    }
+    if (ioctl(fd, LOOP_CONFIGURE, &cfg) == -1)
+    {
+      const int err = errno;
+      close(fd);
+      // Someone else took the device between GET_FREE and CONFIGURE.
+      if (err == EBUSY) continue;
+      log_perr_str(LOG_ERR, "Could not attach loop device", dev, err);
+      break;
+    }
+
+    /* Direct I/O is mandatory: without it, swap writes would be buffered by
+     * the backing file's page cache, which needs memory to make progress.  The
+     * kernel silently drops the flag when the filesystem cannot do direct I/O
+     * with this block size, so read back what is really in effect.
+     */
+    struct loop_info64 info;
+    if (unlikely(ioctl(fd, LOOP_GET_STATUS64, &info) == -1))
+    {
+      log_perr_str(LOG_ERR, "Could not read back the loop device state", dev,
+	  errno);
+      close(fd);	// autoclear detaches the device
+      break;
+    }
+    if (unlikely(!loop_dio_active(&info)))
+    {
+      logm(LOG_ERR,
+	  "Direct I/O is not supported for '%s' by its filesystem or device "
+	  "(loop block size %u); refusing to use crypt mode here",
+	  file, cfg.block_size);
+      close(fd);
+      break;
+    }
+
+    *loopno = n;
+    *loopfd = fd;
+    ok = true;
+  }
+
+  close(ctl);
+  close(backing);
+  return ok;
+}
+#else
+static bool real_loop_attach(const char file[], int *loopno, int *loopfd)
+{
+  logm(LOG_ERR, "Crypt mode needs LOOP_CONFIGURE (Linux 5.8 headers); "
+      "swapspace was built without it");
+  return false;
+}
+#endif
+
+
+static void real_loop_close(int loopfd)
+{
+  close(loopfd);
+}
+
 static int real_run(const char line[])
 {
   return runcommandline(line);
@@ -119,6 +316,8 @@ static int real_swapoff(const char dev[])
 
 static const struct swap_ops real_ops =
 {
+  .loop_attach = real_loop_attach,
+  .loop_close = real_loop_close,
   .run = real_run,
   .mapping_exists = real_mapping_exists,
   .mkswap = real_mkswap,
