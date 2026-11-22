@@ -20,8 +20,9 @@
 # tokens  space-separated settings, "name=value" or a bare "name".  They
 #         are applied on top of the base configuration, so a setting that
 #         repeats one of the base's overrides it.
-# expect  "ok" (exit status 0), "!text" (output must not contain text), or
-#         any other text: exit status 1 with that text in the output.
+# expect  "ok" (exit status 0), "+text" or "!text" (output must or must not
+#         contain text, whatever the exit status), or any other text: exit
+#         status 1 with that text in the output.
 #
 # To cover a new option add it to OPTIONS below and give it boundary rows.
 
@@ -110,6 +111,9 @@ check() {
   ok)
     [ "$RC" -eq 0 ] || bad "$1: expected success, got status $RC: $(head -n 1 "$OUT")"
     ;;
+  '+'*)
+    grep -F -q -- "${2#+}" "$OUT" || bad "$1: output lacks '${2#+}': $(head -n 1 "$OUT")"
+    ;;
   '!'*)
     if grep -F -q -- "${2#!}" "$OUT"; then
       bad "$1: output unexpectedly contains '${2#!}'"
@@ -191,6 +195,14 @@ lsSA|$name=|requires
 *|$name=99999999999999999999|out of range
 *|$name=-99999999999999999999|out of range
 *|$name=9223372036854775807k|out of range
+EOF
+    ;;
+  flag)
+    cat >>"$GEN" <<EOF
+*|$name|ok
+*|$name=1|does not take an argument
+c|$name=|syntax error
+lsS|$name=|does not take an argument
 EOF
     ;;
   esac
@@ -338,6 +350,211 @@ rows <<EOF
 *|min_swapsize=1024k max_swapsize=1048575|min_swapsize > max_swapsize
 *|min_swapsize=1048576 max_swapsize=1k|too small
 EOF
+
+# A string of N characters starting with a slash, with a slash every 200
+# characters so that no path component is too long.
+longstr() {
+  awk -v n="$1" 'BEGIN { s = "/"; while (length(s) < n) s = s (length(s) % 200 == 199 ? "/" : "a"); print s }'
+}
+P4095=$(longstr 4095)
+P4096=$(longstr 4096)
+P4097=$(longstr 4097)
+
+# String options.  The limit is PATH_MAX including the terminating NUL, so
+# 4095 characters fit and 4096 do not; in the configuration file a longer
+# token is no longer one word, which is a syntax error.  swappath and
+# configfile need a value, pidfile does not.
+rows <<EOF
+*|swappath|requires an argument
+*|swappath=$TMP/swap|ok
+*|swappath=relative/dir|not absolute
+*|swappath=.|not absolute
+*|swappath=~/swap|not absolute
+c|swappath=|syntax error
+lsS|swappath=|not absolute
+*|swappath=$P4095|!string too long
+lsSA|swappath=$P4096|string too long
+c|swappath=$P4096|string too long
+lsSA|swappath=$P4097|string too long
+c|swappath=$P4097|syntax error
+*|swappath=relative swappath=$TMP/swap|ok
+*|swappath=$TMP/swap swappath=relative|not absolute
+*|pidfile|ok
+*|pidfile=$TMP/pid|ok
+*|pidfile=relative|ok
+*|pidfile=$P4095|ok
+lsSA|pidfile=$P4096|string too long
+c|pidfile=$P4096|string too long
+lsSA|pidfile=$P4097|string too long
+c|pidfile=$P4097|syntax error
+*|configfile|requires an argument
+*|configfile=$TMP/base.conf|ok
+*|configfile=$P4095|ok
+lsSA|configfile=$P4096|string too long
+c|configfile=$P4096|string too long
+lsSA|configfile=$P4097|string too long
+c|configfile=$P4097|syntax error
+EOF
+
+# Flags: the generated rows above cover the argument checks.  The two that
+# end the program early still succeed in every mode.
+rows <<EOF
+*|quiet verbose|quiet & verbose
+*|quiet quiet|ok
+*|verbose verbose|ok
+*|daemon paranoid quiet|ok
+*|daemon erase inspect|ok
+*|help|ok
+*|version|ok
+EOF
+
+# Keywords that are not options, and repeated settings: the last one wins,
+# but every one must be valid on its own.
+rows <<EOF
+cls|not_an_option=1|unknown configuration item
+cls|not_an_option|unknown configuration item
+cls|free=5|unknown configuration item
+cls|freetarget_x=5|unknown configuration item
+cls|freetarget_|unknown configuration item
+c|Freetarget=50|syntax error
+ls|Freetarget=50|unknown configuration item
+c|max-swapsize=1m|syntax error
+ls|max-swapsize=1m|unknown configuration item
+*|freetarget=10 freetarget=55|ok
+*|freetarget=55 freetarget=10|freetarget < lower_freelimit
+*|freetarget=200 freetarget=55|too large
+*|freetarget=55 freetarget=200|too large
+*|max_swapsize=1m min_swapsize=1m max_swapsize=2t|ok
+*|max_swapsize=2t min_swapsize=1m max_swapsize=1m|ok
+*|max_swapsize=2t min_swapsize=1m max_swapsize=1k|too small
+*|lower_freelimit=70 lower_freelimit=40|ok
+*|lower_freelimit=40 lower_freelimit=70|lower_freelimit > upper_freelimit
+EOF
+
+# Syntax of the configuration file: label|file contents|expect.  The contents
+# are appended to the base configuration and go through printf %b.
+K100=$(awk 'BEGIN { for (i = 0; i < 100; i++) printf "a" }')
+K101=${K100}a
+conf_rows() {
+  while IFS='|' read -r label content expect; do
+    case $label in ''|'#'*) continue ;; esac
+    cp "$TMP/base.conf" "$TMP/case.conf"
+    printf '%b\n' "$content" >>"$TMP/case.conf"
+    run -i -c "$TMP/case.conf"
+    check "conf: $label" "$expect"
+  done
+}
+conf_rows <<EOF
+blanks around everything|   freetarget   =   50   |ok
+tabs|\tfreetarget\t=\t50\t|ok
+no blanks|freetarget=50|ok
+blank after the equals sign only|freetarget= 50|ok
+blank before the equals sign only|freetarget =50|ok
+comment after a value|freetarget = 50 # comment|ok
+comment line|# freetarget = 999|ok
+comment line without a blank|#freetarget=999|ok
+hash directly after a value|freetarget=50#comment|ok
+comment hides nothing it should not|freetarget = 999 # 50|too large
+commented out unknown key|# bogus_key = 1|ok
+blank lines|\n\n   \n\t\n|ok
+carriage return line ending|freetarget = 50\r|ok
+double quoted number|freetarget = "50"|ok
+double quoted path with a blank|swappath = "$TMP/sp ace"|ok
+unquoted path with a blank|swappath = $TMP/sp ace|syntax error
+text after a quoted value|swappath = "$TMP/swap" junk|syntax error
+text after a bare value|freetarget = 50 51|syntax error
+single quotes are not quotes|freetarget = '50'|invalid unit letter
+single quoted path|swappath = '$TMP/swap'|not absolute
+quote inside a value|freetarget = 5"0"|invalid unit letter
+empty double quotes|swappath = ""|not absolute
+equals sign without a value|freetarget =|syntax error
+equals sign without a key|= 50|syntax error
+upper case key|Freetarget = 50|syntax error
+digit in key|freetarget2 = 50|syntax error
+dash in key|free-target = 50|syntax error
+colon instead of equals|freetarget: 50|syntax error
+two settings on a line|freetarget = 50 quiet|syntax error
+command line syntax|--freetarget=50|syntax error
+short option|-f 50|syntax error
+prose|just some words here|syntax error
+number only|50|syntax error
+flag with blanks|   quiet   |ok
+flag with a comment|quiet # not verbose|ok
+flag with a value|quiet = 1|does not take an argument
+flag with an empty value|quiet =|syntax error
+flag with an empty quoted value|quiet = ""|does not take an argument
+number without a value|freetarget|requires an argument
+unknown keyword|bogus = 1|unknown configuration item
+unknown bare keyword|bogus|unknown configuration item
+keyword of 100 characters|$K100 = 1|unknown configuration item
+keyword of 101 characters|$K101 = 1|syntax error
+EOF
+
+# A last line without a newline is still read, and an empty file is fine.
+cp "$TMP/base.conf" "$TMP/case.conf"
+printf 'freetarget = 999' >>"$TMP/case.conf"
+run -i -c "$TMP/case.conf"
+check "conf: last line without newline" "too large"
+: >"$TMP/empty.conf"
+run -i -c "$TMP/empty.conf" -s "$TMP/swap" -l 50 -f 50 -u 60 -x 5
+check "conf: empty file" ok
+
+# The configuration file: -c picks it, a missing one means defaults (with a
+# notice unless -q), anything else that cannot be read is an error.
+FLAGS="-s $TMP/swap -l 50 -f 50 -u 60 -x 5"
+run -i -c "$TMP/missing.conf" $FLAGS
+check "missing configuration file" ok
+check "missing configuration file notice" "+Using default configuration"
+run -i -q -c "$TMP/missing.conf" $FLAGS
+check "missing configuration file with -q" ok
+check "missing configuration file with -q is silent" "!Using default configuration"
+run -i -c "$TMP"
+check "configuration file is a directory" "configuration file"
+if [ ! -r "$TMP/unreadable.conf" ]; then
+  : >"$TMP/unreadable.conf"
+  chmod 000 "$TMP/unreadable.conf"
+  if [ ! -r "$TMP/unreadable.conf" ]; then
+    run -i -c "$TMP/unreadable.conf" $FLAGS
+    check "unreadable configuration file" "Could not open configuration file"
+  fi
+fi
+printf 'freetarget = 999\n' >"$TMP/bad.conf"
+run -i -c "$TMP/bad.conf"
+check "-c selects the bad file" "too large"
+run -i -c "$TMP/bad.conf" -c "$TMP/base.conf"
+check "the last -c wins" ok
+run -i -c "$TMP/base.conf" -c "$TMP/bad.conf"
+check "the last -c wins (bad one last)" "too large"
+run -i --configfile="$TMP/bad.conf"
+check "--configfile selects the bad file" "too large"
+cp "$TMP/base.conf" "$TMP/sp ace/space.conf"
+run -i -c "$TMP/sp ace/space.conf"
+check "configuration file path with a blank" ok
+run -c "$TMP/base.conf" -i
+check "-c before -i" ok
+
+# Command line syntax that is not an option at all.
+LONGNAME=$(awk -v n=16384 'BEGIN { for (i = 0; i < n; i++) printf "a" }')
+cli() {
+  want=$1; shift
+  run "$@" -i -c "$TMP/base.conf"
+  check "cli: $*" "$want"
+}
+cli "Illegal argument: extra" extra
+cli "Illegal argument: -" -
+cli "Illegal argument: --" --
+cli "Illegal argument: --=3" --=3
+cli "Illegal argument: --1" --1=3
+cli "Illegal option: -Z" -Z
+cli "Illegal option: -F" -F
+cli "Illegal option: -b" -b
+cli "'freetarget': invalid unit letter" -f=50
+cli "'free': unknown configuration item" --free=5
+cli "'Freetarget': unknown configuration item" --Freetarget=50
+cli "'daemon': does not take an argument" --daemon extra
+cli "'swappath': requires an argument" --swappath -x 5
+cli "Option name too long" --"$LONGNAME"=1
+cli "unknown configuration item" --"${LONGNAME%a}"=1
 
 if [ "$FAILS" -ne 0 ]; then
   echo "$FAILS of $CASES test_options cases failed" >&2
