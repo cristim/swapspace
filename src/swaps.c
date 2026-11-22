@@ -448,16 +448,18 @@ static bool enable_swapfile(const char file[], int *fault)
  *
  * @param fd file descriptor to write to
  * @param bytes number of bytes to write
+ * @param prealloc whether posix_fallocate() may be used instead of writing
  *
  * @return number of bytes written
  */
-static memsize_t write_data(int fd, memsize_t bytes, bool persevere)
+static memsize_t write_data(int fd, memsize_t bytes, bool persevere,
+    bool prealloc)
 {
   // Round upwards to multiple of page size
   bytes = ext_to_page(bytes);
 #ifdef HAVE_PFALLOCATE
  // Have posix_fallocate().  Much faster way of getting the file populated.
- if (pfalloc_ok && posix_fallocate(fd, 0, bytes) == 0) return bytes;
+ if (prealloc && pfalloc_ok && posix_fallocate(fd, 0, bytes) == 0) return bytes;
  // We have no error backchannel here, so on failure, try the old way.
 #endif
   /* Zero buffer before using it to write data to swapfile.  This doesn't do
@@ -515,14 +517,61 @@ static memsize_t overwrite_data(int fd, memsize_t bytes)
 }
 
 
+/// Delete a swapfile; under --paranoid, overwrite its contents with zeros too.
+/** The file is opened before it is unlinked, so the data can be wiped through
+ * the descriptor.  Clobbers localbuf.
+ *
+ * @param size number of bytes to overwrite, or MEMSIZE_ERROR to use the file's
+ * own size
+ */
+static void remove_swapfile(const char name[], memsize_t size)
+{
+#ifndef NO_CONFIG
+  int fd = -1;
+  if (paranoid)
+    // O_NONBLOCK: a FIFO that happens to have a numeric name must not hang us.
+    fd = open(name, O_WRONLY|O_LARGEFILE|O_NOFOLLOW|O_NONBLOCK);
+#endif
+
+  /* The kernel refuses to unlink a file that is in use as swap.  Then the
+   * contents are live swap data, which must not be wiped either.
+   */
+  if (unlikely(unlink(name) != 0))
+  {
+    log_perr_str(LOG_WARNING, "Could not delete swapfile", name, errno);
+#ifndef NO_CONFIG
+    if (fd != -1) close(fd);
+#endif
+    return;
+  }
+
+#ifndef NO_CONFIG
+  if (fd != -1)
+  {
+    struct stat st;
+    if (size == MEMSIZE_ERROR && fstat(fd, &st) == 0) size = st.st_size;
+    if (size != MEMSIZE_ERROR)
+    {
+      const memsize_t wiped = overwrite_data(fd, size);
+      if (unlikely(wiped < size))
+	log_perr_str(LOG_WARNING, "Could not wipe swapfile", name, errno);
+      if (unlikely(fsync(fd) != 0))
+	log_perr(LOG_WARNING, "Could not flush swapfile", errno);
+    }
+    close(fd);
+  }
+#endif
+}
+
+
 /// Populate swapfile by writing data to it
 /**
  * @return Real size of created file, or zero on failure
  */
-static memsize_t fill_swapfile(const char file[], int fd, memsize_t size)
+static memsize_t fill_swapfile(const char file[], int fd, memsize_t size,
+    bool prealloc)
 {
-  //
-  memsize_t bytes = write_data(fd, size, false);
+  memsize_t bytes = write_data(fd, size, false, prealloc);
 
   if (unlikely(bytes < size))
   {
@@ -582,7 +631,7 @@ static memsize_t make_swapfile(const char file[], memsize_t size)
     return 0;
   }
 
-  if (unlikely(!fill_swapfile(file, fd, size)))
+  if (unlikely(!fill_swapfile(file, fd, size, true)))
   {
     size = 0;
     unlink(file);
@@ -716,9 +765,12 @@ bool activate_old_swaps(void)
 }
 
 
+/// Where the kernel lists active swap; tests that include this file change it
+static const char *proc_swaps_path = "/proc/swaps";
+
 static FILE *open_proc_swaps(void)
 {
-  FILE *fp = fopen("/proc/swaps", "r");
+  FILE *fp = fopen(proc_swaps_path, "r");
   if (unlikely(!fp)) log_perr(LOG_ERR, "Could not open /proc/swaps", errno);
   return fp;
 }
@@ -906,25 +958,7 @@ static bool retire_swapfile(int file)
 #endif
   if (unlikely(swapops->swapoff(namebuf) == -1)) return false;
 
-#ifndef NO_CONFIG
-  int fd = -1;
-  if (paranoid)
-    fd = open(namebuf, O_WRONLY|O_LARGEFILE|O_NOFOLLOW);
-#endif
-
-  unlink(namebuf);
-
-#ifndef NO_CONFIG
-  if (fd != -1) {
-    const memsize_t size = swapfiles[file].size;
-    const memsize_t wiped = overwrite_data(fd, size);
-    if (unlikely(wiped < size))
-      log_perr_str(LOG_WARNING, "Could not wipe swapfile", namebuf, errno);
-    if (unlikely(fsync(fd) != 0))
-      log_perr(LOG_WARNING, "Could not flush swapfile", errno);
-    close(fd);
-  }
-#endif
+  remove_swapfile(namebuf, swapfiles[file].size);
 
   swapfiles[file].size = 0;
   return true;
