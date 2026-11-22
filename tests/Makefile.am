@@ -21,4 +21,4 @@ else
 TESTS = test_calc test_crypt test_cli.sh test_crypt_cli.sh
 endif
 
-EXTRA_DIST = test_cli.sh test_crypt_cli.sh root-integration.sh
+EXTRA_DIST = fake_system.h test_cli.sh test_crypt_cli.sh root-integration.sh
