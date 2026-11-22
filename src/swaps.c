@@ -79,6 +79,14 @@ static memsize_t min_swapsize = 4*MEGA;
  */
 static memsize_t max_swapsize = 2*TERA;
 
+/// Active swapfile count at which new swapfiles start to be enlarged
+/** Zero disables compaction.  See compact_limits() in calc.c. */
+static int compact_threshold = 16;
+/// Size multiplier per compaction level
+static int compact_factor = 2;
+/// Upper bound for the compacted maximum swapfile size; zero for none
+static memsize_t compact_max_swapsize = 16*GIGA;
+
 #ifndef NO_CONFIG
 char *set_swappath(long long dummy)
 {
@@ -92,6 +100,22 @@ char *set_min_swapsize(long long size)
 char *set_max_swapsize(long long size)
 {
   max_swapsize = trunc_to_page(size);
+  return NULL;
+}
+
+char *set_compact_threshold(long long count)
+{
+  compact_threshold = (int)count;
+  return NULL;
+}
+char *set_compact_factor(long long factor)
+{
+  compact_factor = (int)factor;
+  return NULL;
+}
+char *set_compact_max_swapsize(long long size)
+{
+  compact_max_swapsize = size;
   return NULL;
 }
 
@@ -109,6 +133,9 @@ bool swaps_check_config(void)
 {
   CHECK_CONFIG_ERR(min_swapsize > max_swapsize);
   CHECK_CONFIG_ERR(min_swapsize < 10*getpagesize());
+  // Below a page the cap would be truncated to zero, which means "no cap".
+  CHECK_CONFIG_ERR(compact_max_swapsize &&
+      compact_max_swapsize < 10*getpagesize());
 
   if (swappath[0] != '/')
   {
@@ -304,13 +331,6 @@ struct Swapfile
 };
 
 static int sequence_number = 0;
-
-/// Power-of-two defining how many active swapfiles to support
-/** Since swapspace allocates swapfiles of increasing sizes, there is probably
- * little need for a large number of swapfile slots.
- */
-#define MAXSWAPS_SHIFT 5
-#define MAX_SWAPFILES (1 << MAXSWAPS_SHIFT)
 
 /// Array of swapfile descriptors
 /** The last element remains zeroed for use as a sentry.
