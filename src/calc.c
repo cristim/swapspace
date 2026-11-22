@@ -150,3 +150,23 @@ bool parse_psi_line(const char line[], int *percent)
   *percent = (int)value;
   return true;
 }
+
+
+memsize_t percent_swap_request(memsize_t totalspace, memsize_t freespace,
+    int freepct, int lower_freelimit, int upper_freelimit, int freetarget,
+    bool pressure)
+{
+  memsize_t request = 0;
+
+  // Policy: once we hit either freelimit, steer for "freetarget"% free space.
+  // Under memory pressure we also steer there while at or below the target.
+  if (freepct < lower_freelimit || freepct > upper_freelimit ||
+      (pressure && freepct <= freetarget))
+    request = ideal_swapsize(totalspace, freespace, freetarget);
+
+  // Freeing swap while tasks are stalling would only make things worse.
+  if (pressure && request < 0) request = 0;
+
+  return request;
+}
+

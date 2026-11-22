@@ -596,7 +596,6 @@ memsize_t memory_target(void)
   if (unlikely(!read_proc_meminfo(&st))) return MEMSIZE_ERROR;
 
   const int freepct = pct_free(&st);
-  memsize_t request = 0;
 
   /* Ask the kernel whether tasks are actually stalling.  PSI is a much more
    * direct signal than our free-memory estimate, so under pressure we steer
@@ -606,16 +605,9 @@ memsize_t memory_target(void)
   const bool pressure =
     (psi_threshold > 0) && read_psi(&psi) && (psi >= psi_threshold);
 
-  // Policy: once we hit either freelimit, steer for "freetarget"% free space
   // TODO: Use /proc/sys/vm/min_free_kbytes when no swap yet allocated?
-  if (freepct < lower_freelimit || freepct > upper_freelimit ||
-      (pressure && freepct <= freetarget))
-    request = ideal_swapsize(space_total(&st), space_free(&st), freetarget);
-
-  // Freeing swap while tasks are stalling would only make things worse.
-  if (pressure && request < 0) request = 0;
-
-  return request;
+  return percent_swap_request(space_total(&st), space_free(&st), freepct,
+      lower_freelimit, upper_freelimit, freetarget, pressure);
 }
 
 

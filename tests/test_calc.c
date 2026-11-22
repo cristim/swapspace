@@ -81,6 +81,31 @@ int main(void)
   // values near LLONG_MAX.
   CHECK(parse_cgroup_limit("9223372036854771712\n", &cg));
 
+  // ---- Percentage mode: percent_swap_request(total, free, freepct, lower, upper,
+  // target, pressure) with lower=20, upper=60, target=30 --------------------
+  // Inside the band: nothing to do.
+  CHECK(percent_swap_request(100000, 40000, 40, 20, 60, 30, false) == 0);
+  CHECK(percent_swap_request(100000, 20000, 20, 20, 60, 30, false) == 0);
+  CHECK(percent_swap_request(100000, 60000, 60, 20, 60, 30, false) == 0);
+  // Below the lower limit: add swap towards the target.
+  CHECK(percent_swap_request(100000, 10000, 10, 20, 60, 30, false) > 0);
+  CHECK(percent_swap_request(100000, 19999, 19, 20, 60, 30, false) > 0);
+  // Above the upper limit: report excess.
+  CHECK(percent_swap_request(100000, 80000, 80, 20, 60, 30, false) < 0);
+  CHECK(percent_swap_request(100000, 61000, 61, 20, 60, 30, false) < 0);
+  // Pressure inside the band and at or below the target: add swap early.
+  CHECK(percent_swap_request(100000, 25000, 25, 20, 60, 30, true) > 0);
+  CHECK(percent_swap_request(100000, 30000, 30, 20, 60, 30, true) == 0);
+  // Pressure above the target but inside the band: leave it alone.
+  CHECK(percent_swap_request(100000, 45000, 45, 20, 60, 30, true) == 0);
+  // Pressure above the upper limit: never release swap.
+  CHECK(percent_swap_request(100000, 80000, 80, 20, 60, 30, true) == 0);
+  // Pressure below the lower limit still adds.
+  CHECK(percent_swap_request(100000, 10000, 10, 20, 60, 30, true) > 0);
+  // The amount agrees with ideal_swapsize().
+  CHECK(percent_swap_request(100000, 10000, 10, 20, 60, 30, false) ==
+        ideal_swapsize(100000, 10000, 30));
+
   if (failures) fprintf(stderr, "%d check(s) failed\n", failures);
   return failures ? 1 : 0;
 }
