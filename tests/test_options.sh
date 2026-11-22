@@ -682,6 +682,89 @@ printf 'swappath = "%s"\nlower_freelimit = 50\nfreetarget = 50\nupper_freelimit 
 run -e -c "$TMP/blank.conf"
 check "-e with a blank in the swap path" "swap path contains whitespace"
 
+# -V and -h print to standard output, leave standard error empty and exit
+# with status 0 before any configuration is read.
+ERR="$TMP/err"
+run_split() {
+  "$BIN" "$@" >"$OUT" 2>"$ERR" </dev/null
+  RC=$?
+}
+VERSION=$(sed -n 's/^AC_INIT(\[[^]]*\], *\[\([^]]*\)\].*/\1/p' "$SRCDIR/../configure.ac" 2>/dev/null)
+for how in -V --version; do
+  run_split $how
+  check "$how" ok
+  test -s "$ERR" && bad "$how wrote to standard error"
+  grep -q '^swapspace [0-9]' "$OUT" || bad "$how does not print 'swapspace <version>'"
+  if [ -n "$VERSION" ]; then
+    [ "$(head -n 1 "$OUT")" = "swapspace $VERSION" ] ||
+      bad "$how prints '$(head -n 1 "$OUT")', configure.ac says '$VERSION'"
+  fi
+  grep -q 'GNU' "$OUT" || bad "$how does not print the licence notice"
+done
+run_split -V
+cp "$OUT" "$TMP/version.out"
+run_split --version
+cmp -s "$OUT" "$TMP/version.out" || bad "-V and --version print different text"
+printf 'version\n' >"$TMP/version.conf"
+run_split -c "$TMP/version.conf"
+cmp -s "$OUT" "$TMP/version.out" || bad "version in the configuration file prints different text"
+
+run_split -h
+cp "$OUT" "$TMP/help.out"
+check "-h" ok
+test -s "$ERR" && bad "-h wrote to standard error"
+grep -q '^Usage: swapspace' "$OUT" || bad "-h does not print a usage line"
+run_split --help
+cmp -s "$OUT" "$TMP/help.out" || bad "-h and --help print different text"
+printf 'help\n' >"$TMP/help.conf"
+run_split -c "$TMP/help.conf"
+cmp -s "$OUT" "$TMP/help.out" || bad "help in the configuration file prints different text"
+
+# Every option has a line with its short letter, its long name and the kind of
+# argument it takes, followed by a description; there are no other lines, and
+# they come in the order of the table.
+TAB=$(printf '\t')
+nopts=0
+: >"$TMP/help.names"
+while read -r name letter kind; do
+  test -n "$name" || continue
+  nopts=$((nopts+1))
+  case $kind in
+  num)  pat="^  -$letter n, +--$name=n *$TAB." ;;
+  str)  pat="^  -$letter s, +--$name=s *$TAB." ;;
+  flag) pat="^  -$letter, +--$name *$TAB." ;;
+  esac
+  CASES=$((CASES+1))
+  grep -E -q -- "$pat" "$TMP/help.out" || bad "-h has no line like '$pat'"
+  echo "$name" >>"$TMP/help.names"
+done <<EOF
+$OPTIONS
+EOF
+CASES=$((CASES+1))
+[ "$(grep -c '^  -' "$TMP/help.out")" -eq "$nopts" ] ||
+  bad "-h lists $(grep -c '^  -' "$TMP/help.out") options, expected $nopts"
+sed -n 's/^  -[^,]*, *--\([a-z_]*\).*/\1/p' "$TMP/help.out" >"$TMP/help.order"
+cmp -s "$TMP/help.order" "$TMP/help.names" || bad "-h does not list the options in the table's order"
+sort -c "$TMP/help.names" 2>/dev/null || bad "OPTIONS is not sorted by long name"
+
+# They stop at the first of -V and -h, but not before an error that comes
+# earlier on the command line.
+run_split -V -h
+cmp -s "$OUT" "$TMP/version.out" || bad "-V -h does not stop at -V"
+run_split -h -V
+cmp -s "$OUT" "$TMP/help.out" || bad "-h -V does not stop at -h"
+for how in -V -h; do
+  run_split $how -c "$TMP/missing.conf" --bogus
+  check "$how before a bad option" ok
+  run_split -c "$TMP/missing.conf" -Z $how
+  CASES=$((CASES+1))
+  [ -s "$OUT" ] && bad "$how printed text after a bad option"
+  cp "$ERR" "$OUT"
+  check "$how after a bad option" "Illegal option: -Z"
+  run_split $how -c "$TMP/bad.conf"
+  check "$how ignores the configuration file" ok
+done
+
 if [ "$FAILS" -ne 0 ]; then
   echo "$FAILS of $CASES test_options cases failed" >&2
   exit 1
