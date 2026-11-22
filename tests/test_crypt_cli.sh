@@ -11,6 +11,12 @@ skip() { echo "SKIP: $*" >&2; exit 77; }
 
 test -x "$BIN" || skip "swapspace binary not built (run 'make' first)"
 
+# Startup in crypt mode looks for mappings named swapspace-<n> on this machine;
+# a real one (a running crypt instance) would make the results depend on it.
+for m in /dev/mapper/swapspace-*; do
+  test -e "$m" && skip "a mapping named swapspace-<n> exists on this machine"
+done
+
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/swapspace-crypt-test.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
@@ -90,6 +96,38 @@ cat "$TMP/base.conf" "$TMP/c3.conf" >"$TMP/c3full.conf"
 if "$BIN" -i -c "$TMP/c3full.conf" >/dev/null 2>&1; then
   fail "crypt flag with an argument accepted"
 fi
+
+# Startup in crypt mode never reuses an inactive old file, because its key is
+# gone or it may be plain.  It deletes it, and does not touch other names.
+# (This runs unprivileged: nothing is activated.)
+mkdir "$TMP/old"
+chmod 700 "$TMP/old"
+printf 'swappath = "%s"\nlower_freelimit = 50\nfreetarget = 50\nupper_freelimit = 60\npsi_threshold = 5\n' "$TMP/old" >"$TMP/old.conf"
+dd if=/dev/zero of="$TMP/old/0" bs=1k count=64 2>/dev/null
+dd if=/dev/zero of="$TMP/old/7" bs=1k count=64 2>/dev/null
+echo keep >"$TMP/old/notes"
+"$BIN" -e -E -c "$TMP/old.conf" >"$TMP/old.log" 2>&1 || fail "-e -E on old files failed"
+test ! -e "$TMP/old/0" || fail "old swapfile 0 kept in crypt mode"
+test ! -e "$TMP/old/7" || fail "old swapfile 7 kept in crypt mode"
+test -e "$TMP/old/notes" || fail "unrelated file deleted"
+grep -q "crypt mode cannot reuse" "$TMP/old.log" || fail "no log line for deleted old file"
+
+# With --paranoid the old file is overwritten before it is deleted.  A second
+# name for the same data lets the test look at it afterwards.
+yes M | head -c 65536 >"$TMP/old/2"
+ln "$TMP/old/2" "$TMP/old/data-of-2"
+"$BIN" -e -E --paranoid -c "$TMP/old.conf" >"$TMP/old2.log" 2>&1 ||
+  fail "-e -E --paranoid on an old file failed"
+test ! -e "$TMP/old/2" || fail "old swapfile 2 kept in crypt mode"
+test "$(wc -c <"$TMP/old/data-of-2")" -eq 65536 || fail "wiped file changed size"
+test "$(tr -d '\0' <"$TMP/old/data-of-2" | wc -c)" -eq 0 ||
+  fail "old swapfile not wiped under --paranoid"
+# Control: without --paranoid the contents are left as they were.
+yes M | head -c 65536 >"$TMP/old/2"
+ln -f "$TMP/old/2" "$TMP/old/data-of-2"
+"$BIN" -e -E -c "$TMP/old.conf" >"$TMP/old3.log" 2>&1 || fail "-e -E failed"
+test "$(tr -d '\0' <"$TMP/old/data-of-2" | wc -c)" -gt 0 ||
+  fail "control: file was wiped without --paranoid"
 
 # Crypt off keeps the erase path working unprivileged on an empty directory.
 "$BIN" -e -c "$TMP/base.conf" >/dev/null 2>&1 || fail "-e failed with crypt off"

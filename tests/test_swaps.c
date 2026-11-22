@@ -586,6 +586,120 @@ static void test_retire(void)
 }
 
 
+/// The fake sysfs of the adoption tests: dm-3 is our swapspace-5, dm-4 is a
+/// swapspace-6 on another directory's file, dm-9 is not ours by name
+static void adoption_sysfs(void)
+{
+  static const char *const loopB[] = { "loop3", NULL };
+  fake_mkdirs("elsewhere");
+  fake_write("data", "elsewhere/5");
+  fake_sysfs_mapping(3, 5, 2, swapfile_path(5));
+  fake_sysfs_mapping(4, 6, 3, fake_path("elsewhere/5"));
+  fake_sysfs_dm(9, "cryptroot", loopB);
+}
+
+static void test_adoption(void)
+{
+  char body[1024];
+
+  reset(true);
+  adoption_sysfs();
+  make_file("5", 4 * page(), '\0');
+
+  // Our mapping, listed as a dm node: adopted, marked encrypted.
+  set_proc_swaps("/dev/dm-3\t\t\t\tpartition\t4096\t\t8\t\t-2\n");
+  CHECK(read_proc_swaps());
+  CHECK(swapfiles[5].size == 4096 * KILO && swapfiles[5].crypt);
+  CHECK(swapfiles[5].used == 8 * KILO);
+
+  // Already tracked: re-checked on every read against the recorded identity.
+  // While the mapping is the same it stays; once the loop device behind the
+  // name backs something else, the slot is forgotten and reported once.
+  CHECK(read_proc_swaps() && swapfiles[5].size != 0);
+  CHECK(swapfiles[5].traced);
+  fake_sysfs_loop("loop2", fake_path("elsewhere/5"));
+  CHECK(read_proc_swaps());
+  CHECK(swapfiles[5].size == 0 && !swapfiles[5].crypt);
+  CHECK(read_proc_swaps() && swapfiles[5].size == 0);
+  {
+    const char *first = strstr(logtext, "Ignoring mapping swapspace-5");
+    CHECK(first != NULL);
+    CHECK(first && strstr(first + 1, "Ignoring mapping swapspace-5") == NULL);
+  }
+
+  // The same, listed by its mapper name.
+  reset(true);
+  adoption_sysfs();
+  make_file("5", 4 * page(), '\0');
+  set_proc_swaps("/dev/mapper/swapspace-5\tpartition\t4096\t\t0\t\t-2\n");
+  CHECK(read_proc_swaps());
+  CHECK(swapfiles[5].size == 4096 * KILO && swapfiles[5].crypt);
+
+  // A slot we just created is traced when it first shows up in /proc/swaps.
+  reset(true);
+  CHECK(alloc_swapfile(8 * page()));
+  CHECK(!swapfiles[0].traced);
+  fake_sysfs_mapping(3, 0, 2, swapfile_path(0));
+  set_proc_swaps("/dev/mapper/swapspace-0\tpartition\t4096\t\t0\t\t-2\n");
+  CHECK(read_proc_swaps());
+  CHECK(swapfiles[0].crypt && swapfiles[0].traced && swapfiles[0].size == 4096 * KILO);
+
+  // Not adopted: no file of that number here (this also covers the mapping
+  // that belongs to nothing of ours).
+  reset(true);
+  adoption_sysfs();
+  set_proc_swaps("/dev/dm-3\t\t\t\tpartition\t4096\t\t0\t\t-2\n");
+  CHECK(read_proc_swaps());
+  CHECK(swapfiles[5].size == 0);
+
+  // Not adopted: the mapping sits on another directory's file, although a
+  // file of that number exists here too.  Reported once.
+  reset(true);
+  adoption_sysfs();
+  make_file("6", 4 * page(), '\0');
+  set_proc_swaps("/dev/dm-4\t\t\t\tpartition\t4096\t\t0\t\t-2\n");
+  CHECK(read_proc_swaps());
+  CHECK(read_proc_swaps());
+  CHECK(swapfiles[6].size == 0 && !swapfiles[6].crypt);
+  {
+    const char *first = strstr(logtext, "Ignoring");
+    CHECK(first != NULL);
+    CHECK(first && strstr(first + 1, "Ignoring") == NULL);
+  }
+  // Such a mapping is never retired by us: retirement works on tracked slots.
+  CHECK(retire_all());
+  CHECK(fake.log[0] == '\0' && exists("6"));
+
+  // Not ours: a dm device of another name, and a plain partition.
+  reset(true);
+  adoption_sysfs();
+  make_file("5", 4 * page(), '\0');
+  snprintf(body, sizeof(body),
+      "/dev/dm-9\t\t\t\tpartition\t4096\t\t0\t\t-2\n"
+      "/dev/sda2\t\t\t\tpartition\t4096\t\t0\t\t-3\n");
+  set_proc_swaps(body);
+  CHECK(read_proc_swaps());
+  for (int i = 0; i < MAX_SWAPFILES; ++i) CHECK(swapfiles[i].size == 0);
+
+  // A plain swapfile in our directory is adopted as plain, with crypt on too.
+  reset(true);
+  make_file("2", 4 * page(), '\0');
+  snprintf(body, sizeof(body), "%s/2\t\tfile\t\t4096\t\t0\t\t-2\n", swappath);
+  set_proc_swaps(body);
+  CHECK(read_proc_swaps());
+  CHECK(swapfiles[2].size == 4096 * KILO && !swapfiles[2].crypt);
+
+  // A tracked encrypted slot that disappears from the list is forgotten.
+  reset(true);
+  adoption_sysfs();
+  make_file("5", 4 * page(), '\0');
+  set_proc_swaps("/dev/dm-3\t\t\t\tpartition\t4096\t\t0\t\t-2\n");
+  CHECK(read_proc_swaps() && swapfiles[5].size != 0);
+  set_proc_swaps("");
+  CHECK(read_proc_swaps() && swapfiles[5].size == 0);
+}
+
+
 /// Startup with crypt off: old files are reused as before
 static void test_startup_plain(void)
 {
@@ -622,6 +736,120 @@ static void test_startup_plain(void)
 }
 
 
+static void test_startup(void)
+{
+  const size_t size = 4 * (size_t)page();
+
+#ifndef NO_CONFIG
+  // Crypt on: an inactive old file is deleted, wiped first under --paranoid.
+  reset(true);
+  paranoid = true;
+  make_file("3", size, 'M');
+  CHECK(link("3", "keep") == 0);
+  CHECK(activate_old_swaps());
+  CHECK(!exists("3") && exists("keep"));
+  CHECK(all_bytes("keep", '\0'));
+  CHECK(fake.log[0] == '\0');
+
+  // Control: without --paranoid the data is not touched, so the check above
+  // really detects a wipe.
+  reset(true);
+  make_file("3", size, 'M');
+  CHECK(link("3", "keep") == 0);
+  CHECK(activate_old_swaps());
+  CHECK(!exists("3") && all_bytes("keep", 'M'));
+#endif
+
+  // A stale mapping of ours goes first.
+  reset(true);
+  make_file("3", size, 'M');
+  add_mapping(3, swapfile_path(3));
+  CHECK(activate_old_swaps());
+  CHECK_LOG("close");
+  CHECK(!exists("3") && fake.mapped == 0);
+
+  // If it cannot be removed, the file it holds is left alone.
+  reset(true);
+  make_file("3", size, 'M');
+  add_mapping(3, swapfile_path(3));
+  fake.fail_close = true;
+  CHECK(activate_old_swaps());
+  CHECK(exists("3") && fake.mapped == 1u << 3);
+
+  /* A mapping of that name that sits on another directory's file is not ours,
+   * in either mode: it is not closed, and its slot is left as it is in crypt
+   * mode.  With crypt off the file is a plain swapfile, which a mapping name
+   * does not affect.
+   */
+  fake_mkdirs("elsewhere");
+  fake_write("data", "elsewhere/3");
+  reset(true);
+  make_file("3", size, 'M');
+  add_mapping(3, fake_path("elsewhere/3"));
+  CHECK(activate_old_swaps());
+  CHECK_LOG("");
+  CHECK(exists("3") && fake.mapped == 1u << 3);
+  CHECK(strstr(logtext, "Ignoring mapping swapspace-3") != NULL);
+
+  reset(false);
+  make_file("3", size, '\0');
+  add_mapping(3, fake_path("elsewhere/3"));
+  CHECK(activate_old_swaps());
+  CHECK_LOG("plain-mkswap;plain-swapon");
+  CHECK(exists("3") && fake.mapped == 1u << 3);
+
+  // With crypt off a leftover mapping of ours is still removed first.
+  reset(false);
+  make_file("3", size, '\0');
+  add_mapping(3, swapfile_path(3));
+  CHECK(activate_old_swaps());
+  CHECK_LOG("close;plain-mkswap;plain-swapon");
+  CHECK(fake.mapped == 0);
+
+  // A symlink or a FIFO is never deleted, closed or adopted, in either mode.
+  for (int crypt = 0; crypt < 2; ++crypt)
+  {
+    reset(crypt);
+    make_file("target", size, 'T');
+    CHECK(symlink("target", "3") == 0 && mkfifo("4", 0600) == 0);
+    add_mapping(3, fake_path("swap/target"));
+    CHECK(activate_old_swaps() && exists("3") && exists("4"));
+    CHECK(all_bytes("target", 'T') && fake.mapped == 1u << 3 && !fake.log[0]);
+    set_proc_swaps("/dev/mapper/swapspace-3\tpartition\t4096\t\t0\t\t-2\n");
+    CHECK(read_proc_swaps() && swapfiles[3].size == 0);
+  }
+
+  // Crypt on: a file that is in use as swap but is listed under another path
+  // to the same directory must not be deleted.
+  if (symlink(fake_path("swap"), fake_path("alias")) != 0 && errno != EEXIST)
+    perror("symlink");
+  reset(true);
+  make_file("3", size, 'M');
+  {
+    char body[1024];
+    snprintf(body, sizeof(body), "%s/3\t\tfile\t\t4096\t\t0\t\t-2\n",
+	fake_path("alias"));
+    set_proc_swaps(body);
+  }
+  CHECK(activate_old_swaps());
+  CHECK(exists("3") && all_bytes("3", 'M') && fake.log[0] == '\0');
+  CHECK(strstr(logtext, "in use as swap") != NULL);
+  // Control: the same file, not listed, is deleted.
+  set_proc_swaps("");
+  CHECK(activate_old_swaps());
+  CHECK(!exists("3"));
+
+  // Names that are not swapfile numbers are never touched.
+  reset(true);
+  SET_PARANOID(true);
+  make_file("notes", size, 'N');
+  make_file("33", size, 'N');
+  CHECK(activate_old_swaps());
+  CHECK(exists("notes") && exists("33") && all_bytes("notes", 'N'));
+
+}
+
+
 int main(void)
 {
   fake_dir_create("swapspace-swaps");
@@ -645,7 +873,9 @@ int main(void)
   test_dump_stats();
   test_dump_stats_crypt();
   test_retire();
+  test_adoption();
   test_startup_plain();
+  test_startup();
 
   if (chdir(cwd) != 0) perror("chdir back");
   fake_dir_remove();
