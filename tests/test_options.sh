@@ -35,7 +35,12 @@ skip() { echo "SKIP: $*" >&2; exit 77; }
 test -x "$BIN" || skip "swapspace binary not built (run 'make' first)"
 
 PS=$(getconf PAGESIZE 2>/dev/null) || skip "getconf PAGESIZE is unavailable"
-LONG_MAX=$(getconf LONG_MAX 2>/dev/null) || LONG_MAX=0
+# getconf has no LONG_MAX on glibc, but LONG_BIT tells whether long is 64 bits.
+if [ "$(getconf LONG_BIT 2>/dev/null)" = 64 ]; then
+  LONG_MAX=9223372036854775807
+else
+  LONG_MAX=0
+fi
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/swapspace-opts.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
@@ -195,6 +200,7 @@ lsSA|$name=|requires
 *|$name=99999999999999999999|out of range
 *|$name=-99999999999999999999|out of range
 *|$name=9223372036854775807k|out of range
+*|$name=-9223372036854775807k|out of range
 EOF
     ;;
   flag)
@@ -470,6 +476,7 @@ empty double quotes|swappath = ""|not absolute
 equals sign without a value|freetarget =|syntax error
 equals sign without a key|= 50|syntax error
 upper case key|Freetarget = 50|syntax error
+upper case key with a quoted value|Freetarget = "50"|syntax error
 digit in key|freetarget2 = 50|syntax error
 dash in key|free-target = 50|syntax error
 colon instead of equals|freetarget: 50|syntax error
