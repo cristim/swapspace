@@ -17,6 +17,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 */
 #include "env.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -26,6 +27,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 bool crypt_enabled = false;
 char crypt_cipher[CRYPT_CIPHER_MAX] = CRYPT_DEFAULT_CIPHER;
 int crypt_keysize = CRYPT_DEFAULT_KEYSIZE;
+const char *crypt_sysfs_root = "/sys";
 
 
 #ifndef NO_CONFIG
@@ -143,3 +145,161 @@ int crypt_keysize_bytes(long long bits)
   return (int)(bits / 8);
 }
 
+
+/// Format into buf; false if it did not fit or formatting failed
+#if defined(__GNUC__)
+__attribute__((format(printf, 3, 4)))
+#endif
+static bool fmt(char buf[], size_t size, const char format[], ...)
+{
+  va_list ap;
+  va_start(ap, format);
+  const int n = vsnprintf(buf, size, format, ap);
+  va_end(ap);
+  return n >= 0 && (size_t)n < size;
+}
+
+
+bool crypt_mapper_name(char buf[], size_t size, int seqno)
+{
+  if (seqno < 0) return false;
+  return fmt(buf, size, CRYPT_NAME_PREFIX "%d", seqno);
+}
+
+
+bool crypt_mapper_path(char buf[], size_t size, int seqno)
+{
+  if (seqno < 0) return false;
+  return fmt(buf, size, CRYPT_MAPPER_DIR CRYPT_NAME_PREFIX "%d", seqno);
+}
+
+
+/// Parse a plain decimal number: digits only, no leading zeros, below limit
+static bool parse_decimal(const char text[], int limit, int *result)
+{
+  if (!*text) return false;
+  if (text[0] == '0' && text[1]) return false;
+
+  long value = 0;
+  for (const char *p = text; *p; ++p)
+  {
+    if (*p < '0' || *p > '9') return false;
+    value = value * 10 + (*p - '0');
+    if (value >= limit) return false;
+  }
+  *result = (int)value;
+  return true;
+}
+
+
+bool crypt_parse_mapper_name(const char name[], int limit, int *seqno)
+{
+  const size_t plen = strlen(CRYPT_NAME_PREFIX);
+  if (strncmp(name, CRYPT_NAME_PREFIX, plen) != 0) return false;
+  return parse_decimal(name + plen, limit, seqno);
+}
+
+
+bool crypt_parse_mapper_path(const char path[], int limit, int *seqno)
+{
+  const size_t dlen = strlen(CRYPT_MAPPER_DIR);
+  if (strncmp(path, CRYPT_MAPPER_DIR, dlen) != 0) return false;
+  return crypt_parse_mapper_name(path + dlen, limit, seqno);
+}
+
+
+bool crypt_sysfs_block_path(char buf[], size_t size, const char node[],
+    const char rest[])
+{
+  if (!node || !*node) return false;
+  if (!rest || !*rest) return fmt(buf, size, "%s/block/%s", crypt_sysfs_root, node);
+  return fmt(buf, size, "%s/block/%s/%s", crypt_sysfs_root, node, rest);
+}
+
+
+bool crypt_dm_node_number(const char devpath[], int *dmno)
+{
+  static const char prefix[] = "/dev/dm-";
+  if (strncmp(devpath, prefix, sizeof(prefix)-1) != 0) return false;
+  const char *const digits = devpath + sizeof(prefix)-1;
+
+  // Plain decimal only; the kernel decides whether the device exists.
+  if (!*digits || strlen(digits) > 9) return false;
+  long value = 0;
+  for (const char *p = digits; *p; ++p)
+  {
+    if (*p < '0' || *p > '9') return false;
+    value = value * 10 + (*p - '0');
+  }
+  *dmno = (int)value;
+  return true;
+}
+
+
+bool crypt_dm_sysfs_path(const char devpath[], char buf[], size_t size)
+{
+  int dmno;
+  if (!crypt_dm_node_number(devpath, &dmno)) return false;
+
+  char node[32];
+  return fmt(node, sizeof(node), "dm-%d", dmno) &&
+    crypt_sysfs_block_path(buf, size, node, "dm/name");
+}
+
+
+unsigned int crypt_loop_blocksize(unsigned long dio_align, unsigned long blksize,
+    unsigned long pagesize)
+{
+  unsigned long want;
+  if (dio_align)
+  {
+    /* Swap needs a logical block size no larger than a page, so an alignment
+     * beyond that cannot be matched.  Return 0: the caller must refuse, since
+     * block size 0 would make loop.c take the alignment and keep direct I/O.
+     */
+    if (dio_align > pagesize) return 0;
+    want = dio_align;
+  }
+  else
+  {
+    // Only a preferred size: it can be large (striping), so it is not a need.
+    want = blksize < pagesize ? blksize : pagesize;
+  }
+
+  unsigned long bs = 512;
+  while (bs < want) bs <<= 1;
+  return (unsigned int)bs;
+}
+
+
+bool crypt_loop_path(char buf[], size_t size, int loopno)
+{
+  if (loopno < 0) return false;
+  return fmt(buf, size, "/dev/loop%d", loopno);
+}
+
+
+bool crypt_open_cmd(char buf[], size_t size, const char cipher[],
+    long long bits, int seqno, int loopno)
+{
+  if (seqno < 0 || loopno < 0) return false;
+  if (!crypt_cipher_valid(cipher) || !crypt_keysize_valid(cipher, bits))
+    return false;
+
+  return fmt(buf, size,
+      "cryptsetup open --type plain --cipher '%s' --key-size %d "
+      "--key-file /dev/urandom --keyfile-size %d --batch-mode "
+      "/dev/loop%d " CRYPT_NAME_PREFIX "%d",
+      cipher,
+      (int)bits,
+      crypt_keysize_bytes(bits),
+      loopno,
+      seqno);
+}
+
+
+bool crypt_close_cmd(char buf[], size_t size, int seqno)
+{
+  if (seqno < 0) return false;
+  return fmt(buf, size, "cryptsetup close " CRYPT_NAME_PREFIX "%d", seqno);
+}

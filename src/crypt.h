@@ -78,4 +78,84 @@ bool crypt_keysize_valid(const char cipher[], long long bits);
 /// Number of key bytes for a key size in bits, or 0 if the size is unusable
 int crypt_keysize_bytes(long long bits);
 
+/// Prefix of the device-mapper names we create: "swapspace-<seqno>"
+#define CRYPT_NAME_PREFIX "swapspace-"
+/// Directory holding device-mapper nodes
+#define CRYPT_MAPPER_DIR "/dev/mapper/"
+
+/* The formatting helpers write to a caller-provided buffer and return false,
+ * leaving the contents unspecified, if the result (including its NUL) does not
+ * fit or an argument is out of range.
+ */
+
+/// Device-mapper name for swapfile seqno: "swapspace-<seqno>"
+bool crypt_mapper_name(char buf[], size_t size, int seqno);
+
+/// Device node for swapfile seqno: "/dev/mapper/swapspace-<seqno>"
+bool crypt_mapper_path(char buf[], size_t size, int seqno);
+
+/// Recognize "swapspace-<seqno>" with 0 <= seqno < limit
+/** The number must be plain decimal digits without sign or leading zeros, so
+ * that only names we generated are recognized.
+ */
+bool crypt_parse_mapper_name(const char name[], int limit, int *seqno);
+
+/// Recognize "/dev/mapper/swapspace-<seqno>"; see crypt_parse_mapper_name()
+bool crypt_parse_mapper_path(const char path[], int limit, int *seqno);
+
+/// Root of the sysfs mount; "/sys" unless a test points it at a fake tree
+extern const char *crypt_sysfs_root;
+
+/// "<sysfs>/block/<node>" or "<sysfs>/block/<node>/<rest>" (rest may be NULL)
+bool crypt_sysfs_block_path(char buf[], size_t size, const char node[],
+    const char rest[]);
+
+/// Number X of a device node name of the form "/dev/dm-<X>" (plain decimal)
+bool crypt_dm_node_number(const char devpath[], int *dmno);
+
+/// Sysfs file holding the mapper name of a device node such as "/dev/dm-3"
+/** The result is "/sys/block/dm-3/dm/name".  This is how /proc/swaps entries
+ * naming a dm node are traced back to "swapspace-<seqno>".
+ * @return false if devpath is not of the form "/dev/dm-<digits>"
+ */
+bool crypt_dm_sysfs_path(const char devpath[], char buf[], size_t size);
+
+/// Logical block size to give a loop device with direct I/O, or 0 for none
+/** Direct I/O needs the loop device's logical block size to be at least the
+ * backing file's direct I/O offset alignment ("dio_align", from statx, 0 if
+ * unknown): a 4Kn disk needs 4096, while the loop default is 512.  Without that
+ * answer the filesystem's preferred I/O size "blksize" is used instead, capped
+ * at the page size because it can be much larger than any alignment need.
+ * The result is a power of two from 512 up to the page size.
+ *
+ * Mainline allows loop block sizes up to 64 KiB, but swap does I/O in pages,
+ * which a device with larger logical blocks cannot serve, so nothing above the
+ * page size is ever requested.  If the filesystem demands a larger alignment,
+ * the result is 0 and the caller must refuse: handing 0 to the kernel would
+ * make loop.c use that alignment as the block size and keep direct I/O.
+ */
+unsigned int crypt_loop_blocksize(unsigned long dio_align, unsigned long blksize,
+    unsigned long pagesize);
+
+/// Loop device node: "/dev/loop<loopno>"
+bool crypt_loop_path(char buf[], size_t size, int loopno);
+
+/// Compose the cryptsetup command that maps a loop device with a random key
+/** The key is read from /dev/urandom by cryptsetup (plain mode with a key file
+ * uses the file content directly as the key).  The cipher and key size are
+ * validated again here.
+ *
+ * "--keyfile-size" repeats the key size in bytes.  Without --hash, cryptsetup
+ * ignores it for a key file and reads exactly --key-size bits (checked in
+ * action_open_plain() of cryptsetup 2.x, src/cryptsetup.c); the flag is kept
+ * so that the command states what is meant and so that a cryptsetup that does
+ * honour it cannot read more than the key size.  --batch-mode keeps it from
+ * prompting.
+ */
+bool crypt_open_cmd(char buf[], size_t size, const char cipher[],
+    long long bits, int seqno, int loopno);
+
+/// Compose the cryptsetup command that removes the mapping for swapfile seqno
+bool crypt_close_cmd(char buf[], size_t size, int seqno);
+
 #endif
