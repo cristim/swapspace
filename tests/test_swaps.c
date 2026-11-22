@@ -240,6 +240,95 @@ static void test_retire_plain(void)
 }
 
 
+/// The retry after a plain swapon() failing with EINVAL (no posix_fallocate)
+static void test_plain_einval(void)
+{
+  const long long wanted = trunc_to_page(8 * page()) + 2 * page();
+
+  // Exactly one retry, asking for the same size again: the request is reduced
+  // by the overhead that alloc_swapfile() adds back.
+  reset(false);
+  fake.fail_swapon = true;
+  CHECK(!alloc_swapfile(8 * page()));
+  CHECK_LOG("plain-mkswap;plain-swapon;plain-mkswap;plain-swapon");
+  CHECK(fake.plain_sizes_n == 2);
+  CHECK(fake.plain_sizes[0] == wanted && fake.plain_sizes[1] == wanted);
+  CHECK(!pfalloc_ok);
+  CHECK(!exists("0") && swapfiles[0].size == 0);
+
+  // Once quick creation is off, there is no further retry.
+  reset(false);
+  pfalloc_ok = false;
+  fake.fail_swapon = true;
+  CHECK(!alloc_swapfile(8 * page()));
+  CHECK_LOG("plain-mkswap;plain-swapon");
+
+  // Other errors are not retried, and leave quick creation on.
+  const int others[] = { ENOSPC, EBUSY, ENOMEM, EPERM };
+  for (size_t i = 0; i < sizeof(others) / sizeof(*others); ++i)
+  {
+    reset(false);
+    fake.fail_swapon = true;
+    fake.swapon_errno = others[i];
+    CHECK(!alloc_swapfile(8 * page()));
+    CHECK_LOG("plain-mkswap;plain-swapon");
+    CHECK(pfalloc_ok && diets >= 1);
+  }
+}
+
+
+/// dump_stats keeps its table unless some slot is encrypted
+static void test_dump_stats(void)
+{
+  reset(false);
+  CHECK(alloc_swapfile(8 * page()));
+  logtext[0] = '\0';
+  dump_stats();
+  CHECK(strstr(logtext,
+	"file            size            used         created  seen\n") != NULL);
+  CHECK(strstr(logtext, "crypt") == NULL);
+  // One row, ending in the "seen" flag.
+  const char *row = strstr(logtext, "   0");
+  CHECK(row != NULL && strstr(row, "  0\n") != NULL);
+}
+
+
+/// Startup with crypt off: old files are reused as before
+static void test_startup_plain(void)
+{
+  const size_t size = 4 * (size_t)page();
+
+  // An old file is reused as plain swap.
+  reset(false);
+  make_file("3", size, '\0');
+  CHECK(activate_old_swaps());
+  CHECK_LOG("plain-mkswap;plain-swapon");
+  CHECK(exists("3"));
+
+  // A file that cannot be enabled because it is busy (EBUSY) is kept; any
+  // other error deletes it.
+  reset(false);
+  make_file("3", size, '\0');
+  fake.fail_swapon = true;
+  fake.swapon_errno = EBUSY;
+  CHECK(activate_old_swaps());
+  CHECK(exists("3") && swapfiles[3].size == 0);
+
+  reset(false);
+  make_file("3", size, '\0');
+  fake.fail_swapon = true;
+  fake.swapon_errno = ENOSPC;
+  CHECK(activate_old_swaps());
+  CHECK(!exists("3"));
+
+  // Names that are not swapfile numbers are never touched.
+  reset(false);
+  make_file("notes", size, 'N');
+  CHECK(activate_old_swaps());
+  CHECK(exists("notes"));
+}
+
+
 int main(void)
 {
   fake_dir_create("swapspace-swaps");
@@ -258,6 +347,9 @@ int main(void)
   max_swapsize = 256 * page();
 
   test_retire_plain();
+  test_plain_einval();
+  test_dump_stats();
+  test_startup_plain();
 
   if (chdir(cwd) != 0) perror("chdir back");
   fake_dir_remove();
