@@ -343,16 +343,35 @@ void dump_stats(void)
   logm(LOG_INFO, "swapfiles in use: %d", activeswaps);
   if (activeswaps)
   {
+    // The crypt column is only added when some slot is encrypted, so the table
+    // is exactly what it always was otherwise.
+    bool any_crypt = false;
+    for (int i=0; i<MAX_SWAPFILES; ++i)
+      if (swapfiles[i].size && swapfiles[i].crypt) any_crypt = true;
+
     logm(LOG_INFO,
-	"file            size            used         created  seen");
+	"file            size            used         created  seen%s",
+	any_crypt ? "  crypt" : "");
     for (int i=0; i<MAX_SWAPFILES; ++i) if (swapfiles[i].size)
-      logm(LOG_INFO,
-	  "%4d%16lld%16lld%16lld  %d",
-	  i,
-	  swapfiles[i].size,
-	  swapfiles[i].used,
-	  swapfiles[i].created,
-	  (int)swapfiles[i].observed_in_wild);
+    {
+      if (any_crypt)
+	logm(LOG_INFO,
+	    "%4d%16lld%16lld%16lld  %d  %5d",
+	    i,
+	    swapfiles[i].size,
+	    swapfiles[i].used,
+	    swapfiles[i].created,
+	    (int)swapfiles[i].observed_in_wild,
+	    (int)swapfiles[i].crypt);
+      else
+	logm(LOG_INFO,
+	    "%4d%16lld%16lld%16lld  %d",
+	    i,
+	    swapfiles[i].size,
+	    swapfiles[i].used,
+	    swapfiles[i].created,
+	    (int)swapfiles[i].observed_in_wild);
+    }
   }
 }
 
@@ -1023,11 +1042,16 @@ static bool retire_swapfile(int file)
 #ifndef NO_CONFIG
   if (!quiet) logm(LOG_NOTICE, "Retiring swapfile '%d'", file);
 #endif
-  if (unlikely(swapops->swapoff(namebuf) == -1)) return false;
+  if (swapfiles[file].crypt)
+  {
+    if (unlikely(!crypt_retire(file))) return false;
+  }
+  else if (unlikely(swapops->swapoff(namebuf) == -1)) return false;
 
   remove_swapfile(namebuf, swapfiles[file].size);
 
   swapfiles[file].size = 0;
+  swapfiles[file].crypt = false;
   return true;
 }
 

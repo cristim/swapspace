@@ -511,6 +511,81 @@ static void test_dump_stats(void)
 }
 
 
+static void test_dump_stats_crypt(void)
+{
+  reset(true);
+  CHECK(alloc_swapfile(8 * page()));
+  logtext[0] = '\0';
+  dump_stats();
+  CHECK(strstr(logtext, "seen  crypt\n") != NULL);
+  CHECK(strstr(logtext, "      1\n") != NULL);
+}
+
+
+static void test_retire(void)
+{
+  // An encrypted slot is retired through the mapper, whatever the current
+  // setting says.
+  for (int mode = 0; mode < 2; ++mode)
+  {
+    reset(true);
+    CHECK(alloc_swapfile(8 * page()));
+    crypt_enabled = mode;	// retirement must follow the slot, not the setting
+    fake.log[0] = '\0';
+    CHECK(retire_all());
+    CHECK_LOG("swapoff;close");
+    CHECK(!exists("0"));
+    CHECK(swapfiles[0].size == 0 && !swapfiles[0].crypt);
+    CHECK(fake.mapped == 0 && fake.swapped == 0 && fake.plain_calls == 0);
+  }
+
+  // A plain slot is retired by file name, even with crypt on.
+  reset(false);
+  CHECK(alloc_swapfile(8 * page()));
+  crypt_enabled = true;
+  fake.log[0] = '\0';
+  CHECK(retire_all());
+  CHECK_LOG("plain-swapoff");
+  CHECK(!exists("0") && fake.plain_swapped == 0);
+
+  // swapoff failing keeps everything: the file, the mapping and the slot.
+  reset(true);
+  CHECK(alloc_swapfile(8 * page()));
+  fake.log[0] = '\0';
+  fake.fail_swapoff = true;
+  CHECK(!retire_all());
+  CHECK_LOG("swapoff");
+  CHECK(exists("0") && fake.mapped == 1u && swapfiles[0].size != 0);
+
+  // The mapping failing to close after swapoff keeps the file too.
+  reset(true);
+  CHECK(alloc_swapfile(8 * page()));
+  fake.log[0] = '\0';
+  fake.fail_close = true;
+  CHECK(!retire_all());
+  CHECK_LOG("swapoff;close");
+  CHECK(exists("0") && swapfiles[0].size != 0);
+
+#ifndef NO_CONFIG
+  // Paranoid retirement overwrites the file before it is gone.
+  reset(true);
+  paranoid = true;
+  CHECK(alloc_swapfile(8 * page()));
+  CHECK(link("0", "keep") == 0);
+  memset(localbuf, 'S', 16);
+  {
+    // Put recognizable data in the file, as swapped-out pages would be.
+    FILE *fp = fopen("0", "r+");
+    CHECK(fp != NULL);
+    if (fp) { for (int i = 0; i < 4096; ++i) fputc('S', fp); fclose(fp); }
+  }
+  CHECK(retire_all());
+  CHECK(!exists("0") && exists("keep"));
+  CHECK(all_bytes("keep", '\0'));
+#endif
+}
+
+
 /// Startup with crypt off: old files are reused as before
 static void test_startup_plain(void)
 {
@@ -568,6 +643,8 @@ int main(void)
   test_retire_plain();
   test_plain_einval();
   test_dump_stats();
+  test_dump_stats_crypt();
+  test_retire();
   test_startup_plain();
 
   if (chdir(cwd) != 0) perror("chdir back");
