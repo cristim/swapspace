@@ -22,10 +22,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 
 #include "crypt.h"
 
-/* The parts of swap handling that touch the system go through the swap_ops
- * table below, which is a plain set of function pointers to the real
- * implementations (no allocation).  Tests replace the table to inject failures
- * at every step without root.
+/* The parts of crypt mode that touch the system: the loop device ioctls and
+ * the cryptsetup command, plus the mkswap/swapon/swapoff steps on the mapped
+ * device.  All of them go through the swap_ops table below, which is a plain
+ * set of function pointers to the real implementations (no allocation).  Tests
+ * replace the table to inject failures at every step without root.
  */
 
 /// System operations used for swap activation; replaceable by tests
@@ -54,6 +55,31 @@ struct swap_ops
 /// The table in use; points at the real implementations unless a test swaps it
 extern const struct swap_ops *swapops;
 
+/// Outcome of setting up an encrypted swapfile
+enum crypt_result
+{
+  /// Done: swap is active on /dev/mapper/swapspace-<n>
+  CRYPT_OK,
+  /// Failed and everything that was set up has been undone
+  CRYPT_FAILED,
+  /// Failed, and a mapping that could not be removed still holds the file.  The
+  /// caller must not delete the file; the leftover is removed later
+  /// (crypt_clear_stale()).
+  CRYPT_HELD
+};
+
+/// What crypt_clear_stale() found in a slot
+enum crypt_stale
+{
+  /// No mapping is left: the slot is free for a new file
+  CRYPT_SLOT_FREE,
+  /// A mapping of ours is left and could not be removed; it holds the file
+  CRYPT_SLOT_HELD,
+  /// A mapping of that name exists but is not backed by our file (another
+  /// instance's, or not provably ours): untouched, and the slot is not usable
+  CRYPT_SLOT_FOREIGN
+};
+
 /// Does a device-mapper device for swapfile seqno exist?
 /** True if /dev/mapper/swapspace-<seqno> exists, or if the kernel lists a dm
  * device of that name even though its node is missing.
@@ -62,6 +88,45 @@ bool crypt_mapping_exists(int seqno);
 
 /// Find the dm device named swapspace-<seqno> in sysfs; true and *dmno if found
 bool crypt_find_dm(int seqno, int *dmno);
+
+/// Back swapfile "file" with an encrypted device /dev/mapper/swapspace-<seqno>
+/** Attaches the file to a free loop device with direct I/O (so swapping does
+ * not go through the backing file's page cache, which can deadlock under
+ * memory pressure), then maps it with a random key via cryptsetup.  The loop
+ * device is set to detach itself when its last user goes away, so nothing is
+ * left behind if this fails or when the mapping is later removed.
+ *
+ * Fails, and creates nothing, if a mapping of that name already exists.  If it
+ * fails, everything it set up has been undone, except that CRYPT_HELD reports
+ * a mapping that could not be removed.  Clobbers localbuf.
+ */
+enum crypt_result crypt_map_file(const char file[], int seqno);
+
+/// Map the file, make swap on the mapped device and enable it.  Clobbers localbuf.
+/** Fails closed: if any step fails (including mkswap), the steps already done
+ * are undone in reverse order, and the file is never enabled as plain swap.
+ */
+enum crypt_result crypt_enable(int seqno, const char file[]);
+
+/// Disable swap on the mapped device for seqno and remove the mapping
+/** Clobbers localbuf.  If swapoff fails, the mapping is left alone.
+ * @return whether both steps succeeded
+ */
+bool crypt_retire(int seqno);
+
+/// Remove the mapping for swapfile seqno.  Clobbers localbuf.
+/** The mapping must not be in use as swap.  The loop device detaches itself.
+ * @return whether cryptsetup succeeded
+ */
+bool crypt_unmap(int seqno);
+
+/// Remove a leftover mapping for seqno if it is ours.  Clobbers localbuf.
+/** Mapping names are global, so a mapping swapspace-<seqno> may belong to
+ * another swapspace instance, in this mode or another.  It is removed only if
+ * its loop device is backed by "file" (a path relative to the current
+ * directory); anything else is left alone, whatever the mode of this process.
+ */
+enum crypt_stale crypt_clear_stale(int seqno, const char file[]);
 
 /// Which swapfile slot does a device name from /proc/swaps belong to?
 /** Recognizes "/dev/mapper/swapspace-<n>" and "/dev/dm-<x>" whose mapper name

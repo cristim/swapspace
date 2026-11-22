@@ -46,6 +46,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 
 /// How often to retry when another process grabs the free loop device first
 #define LOOP_ATTEMPTS 5
+
 /// Slot limit for reading mapper names; matches MAX_SWAPFILES in swaps.c
 #define SLOT_LIMIT 32
 
@@ -326,6 +327,134 @@ static const struct swap_ops real_ops =
 };
 
 const struct swap_ops *swapops = &real_ops;
+
+
+enum crypt_result crypt_map_file(const char file[], int seqno)
+{
+  if (unlikely(swapops->mapping_exists(seqno)))
+  {
+    logm(LOG_ERR, "Device-mapper name swapspace-%d is already in use", seqno);
+    return CRYPT_FAILED;
+  }
+
+  int loopno, loopfd;
+  if (unlikely(!swapops->loop_attach(file, &loopno, &loopfd)))
+  {
+    logm(LOG_ERR, "Could not attach swapfile %d to a loop device", seqno);
+    return CRYPT_FAILED;
+  }
+
+  enum crypt_result result = CRYPT_OK;
+  const bool ok =
+    crypt_open_cmd(localbuf, sizeof(localbuf), crypt_cipher, crypt_keysize,
+	seqno, loopno) &&
+    swapops->run(localbuf) == 0;
+
+  if (unlikely(!ok))
+  {
+    logm(LOG_ERR, "Could not create encrypted mapping swapspace-%d", seqno);
+    result = CRYPT_FAILED;
+    /* The mapping did not exist before we started, so anything there now is
+     * ours.  This covers cryptsetup failing half-way.  If it cannot be removed
+     * it still holds the file through the loop device.
+     */
+    if (swapops->mapping_exists(seqno) && !crypt_unmap(seqno))
+      result = CRYPT_HELD;
+  }
+
+  /* On success the mapping holds the loop device; on failure this was the last
+   * reference and the device detaches.
+   */
+  swapops->loop_close(loopfd);
+  return result;
+}
+
+
+bool crypt_unmap(int seqno)
+{
+  if (unlikely(!crypt_close_cmd(localbuf, sizeof(localbuf), seqno)))
+    return false;
+
+  const int status = swapops->run(localbuf);
+  if (unlikely(status != 0))
+  {
+    logm(LOG_ERR, "cryptsetup close swapspace-%d failed (status %d)", seqno,
+	status);
+    return false;
+  }
+  return true;
+}
+
+
+enum crypt_stale crypt_clear_stale(int seqno, const char file[])
+{
+  if (!swapops->mapping_exists(seqno)) return CRYPT_SLOT_FREE;
+
+  /* The name is global.  Closing a mapping of another instance would take its
+   * swap away (or fail while it is in use); only close what sits on our file.
+   */
+  char dev[64];
+  if (!crypt_mapper_path(dev, sizeof(dev), seqno) ||
+      !crypt_mapping_backed_by(dev, seqno, file))
+    return CRYPT_SLOT_FOREIGN;
+
+  logm(LOG_NOTICE, "Removing leftover mapping swapspace-%d", seqno);
+  crypt_unmap(seqno);
+  return swapops->mapping_exists(seqno) ? CRYPT_SLOT_HELD : CRYPT_SLOT_FREE;
+}
+
+
+enum crypt_result crypt_enable(int seqno, const char file[])
+{
+  char dev[64];
+  if (unlikely(!crypt_mapper_path(dev, sizeof(dev), seqno)))
+    return CRYPT_FAILED;
+
+  const enum crypt_result mapped = crypt_map_file(file, seqno);
+  if (mapped != CRYPT_OK) return mapped;
+
+  /* Unlike plain swapfiles, a failing mkswap is fatal: an unformatted device
+   * must not be offered to swapon.  Nothing here ever falls back to enabling
+   * the plain file.
+   */
+  const int mkstatus = swapops->mkswap(dev);
+  if (unlikely(mkstatus != 0))
+  {
+    logm(LOG_ERR, "mkswap failed for '%s' (status %d)", dev, mkstatus);
+  }
+  else if (unlikely(swapops->swapon(dev) != 0))
+  {
+    const int err = errno;
+    log_perr_str(LOG_ERR, "Could not enable encrypted swap", dev, err);
+  }
+  else
+  {
+    return CRYPT_OK;
+  }
+
+  if (unlikely(!crypt_unmap(seqno)))
+  {
+    logm(LOG_ERR, "Could not remove mapping swapspace-%d; it will be removed "
+	"before this slot is used again", seqno);
+    return CRYPT_HELD;
+  }
+  return CRYPT_FAILED;
+}
+
+
+bool crypt_retire(int seqno)
+{
+  char dev[64];
+  if (unlikely(!crypt_mapper_path(dev, sizeof(dev), seqno))) return false;
+
+  if (unlikely(swapops->swapoff(dev) == -1))
+  {
+    const int err = errno;
+    log_perr_str(LOG_ERR, "Could not disable encrypted swap", dev, err);
+    return false;
+  }
+  return crypt_unmap(seqno);
+}
 
 
 bool crypt_read_mapper_name(const char sysfs_path[], int limit, int *seqno)
