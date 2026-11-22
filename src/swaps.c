@@ -45,6 +45,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <linux/magic.h>
 
 #include "calc.h"
+#include "crypt.h"
 #include "cryptdev.h"
 #include "log.h"
 #include "opts.h"
@@ -302,6 +303,8 @@ struct Swapfile
   long long created;
   /// Has this swapfile been spotted in /proc/swaps?
   bool observed_in_wild;
+  /// Is swap on the encrypted /dev/mapper/swapspace-N rather than on the file?
+  bool crypt;
 };
 
 static int sequence_number = 0;
@@ -604,14 +607,51 @@ static memsize_t fill_swapfile(const char file[], int fd, memsize_t size,
   return bytes;
 }
 
+/// May this new file be used through a direct I/O loop device?
+/** On btrfs a file with copy-on-write and data checksums gets its direct writes
+ * bounced through freshly allocated pages (and checksummed), which is exactly
+ * what must not happen on the swap-out path.  Without NOCOW there, crypt mode
+ * refuses rather than risk a deadlock under memory pressure.  Other
+ * filesystems write in place.  (Even with NOCOW, btrfs may still bounce when
+ * the data profile is DUP or RAID1; that cannot be checked cheaply and is
+ * documented instead.)
+ */
+static bool crypt_file_flags_ok(int fd, const char file[])
+{
+  struct statfs fs;
+  if (unlikely(fstatfs(fd, &fs) != 0))
+  {
+    log_perr_str(LOG_ERR, "Could not identify the filesystem of", file, errno);
+    return false;
+  }
+  if (fs.f_type != BTRFS_SUPER_MAGIC) return true;
+
+  int attr = 0;
+  if (likely(ioctl(fd, FS_IOC_GETFLAGS, &attr) == 0 && (attr & FS_NOCOW_FL)))
+    return true;
+
+  logm(LOG_ERR, "Refusing to create encrypted swapfile '%s': the btrfs swap "
+      "directory does not give it NOCOW, so direct writes would allocate "
+      "memory (see 'crypt' in swapspace(8))", file);
+  return false;
+}
+
+
 /// Create file to be used as swap.  Clobbers localbuf.
-/**
+/** In crypt mode the file is filled with real zeros and flushed instead of
+ * being preallocated.  posix_fallocate() leaves unwritten extents, and the
+ * first direct write to each of them needs a metadata update (allocation,
+ * extent conversion, a journal transaction) on the swap-out path, which is the
+ * wrong place to need memory.  Writing zeros and flushing them (fsync also
+ * forces delayed allocation) leaves only allocated blocks to overwrite.
+ *
  * @param filename File to be created
  * @param size Desired size in bytes (but already rounded to page size)
+ * @param crypt Whether the file will be used through a direct I/O loop device
  * @return Size of new swapfile, which may differ from requested size.  Zero
  * indicates failure, in which case the file is deleted.
  */
-static memsize_t make_swapfile(const char file[], memsize_t size)
+static memsize_t make_swapfile(const char file[], memsize_t size, bool crypt)
 {
   assert(min_swapsize <= max_swapsize);
   assert(max_swapsize == trunc_to_page(max_swapsize));
@@ -631,8 +671,19 @@ static memsize_t make_swapfile(const char file[], memsize_t size)
     return 0;
   }
 
-  if (unlikely(!fill_swapfile(file, fd, size, true)))
+  if (crypt && unlikely(!crypt_file_flags_ok(fd, file)))
   {
+    size = 0;
+    unlink(file);
+  }
+  else if (unlikely(!fill_swapfile(file, fd, size, !crypt)))
+  {
+    size = 0;
+    unlink(file);
+  }
+  else if (crypt && unlikely(fsync(fd) != 0))
+  {
+    log_perr_str(LOG_ERR, "Could not flush swapfile", file, errno);
     size = 0;
     unlink(file);
   }
@@ -662,6 +713,19 @@ static bool valid_swapfile(const char filename[], int *seqno)
   if (unlikely(*endptr || seql < 0 || seql >= MAX_SWAPFILES)) return false;
   *seqno = (int)seql;
   return true;
+}
+
+
+/// Slots whose foreign encrypted mapping has been reported, to log it once
+static unsigned foreign_logged = 0;
+
+/// Say once per slot that a mapping of that name is not ours and left alone
+static void note_foreign(int slot)
+{
+  if (foreign_logged & (1u << slot)) return;
+  foreign_logged |= 1u << slot;
+  logm(LOG_NOTICE, "Ignoring mapping swapspace-%d: it is not backed by a "
+      "swapfile in this swap directory", slot);
 }
 
 
@@ -929,7 +993,10 @@ bool read_proc_swaps(void)
   // Scratch from swapfiles[] any swapfiles that were deactivated from outside
   for (int i=0; i<MAX_SWAPFILES; ++i)
     if (unlikely(swapfiles[i].size && !swapfiles[i].observed_in_wild))
+    {
       swapfiles[i].size = 0;
+      swapfiles[i].crypt = false;
+    }
 
   return true;
 }
@@ -1033,7 +1100,7 @@ bool alloc_swapfile(memsize_t size)
    */
   if (unlikely(size > max_swapsize)) size = max_swapsize;
 
-  const int newswap = find_free(sequence_number);
+  int newswap = find_free(sequence_number);
   if (unlikely(swapfiles[newswap].size))
   {
     // No free slot.  Turn to "diet" policy instead of retrying every second.
@@ -1048,13 +1115,42 @@ bool alloc_swapfile(memsize_t size)
     return false;
   }
 
+  /* A leftover mapping of ours is removed first.  One that is not ours (it
+   * belongs to another instance) is never touched: in crypt mode skip that
+   * slot number and take the next free one.  In plain mode such a mapping does
+   * not hold our file, so the slot is usable; but one that holds it (left by
+   * an earlier crypt run) must not have its file unlinked under it.
+   */
+  const bool crypt = crypt_enabled;
+  char file[30];
+  snprintf(file, sizeof(file), "%d", newswap);
+  bool usable = false;
+  for (int tries = 0; !usable && tries < MAX_SWAPFILES; ++tries)
+  {
+    const enum crypt_stale stale = crypt_clear_stale(newswap, file);
+    usable = stale == CRYPT_SLOT_FREE || (!crypt && stale == CRYPT_SLOT_FOREIGN);
+    if (usable) break;
+
+    sequence_number = newswap;
+    if (stale == CRYPT_SLOT_HELD) break;
+    note_foreign(newswap);
+    const int next = find_free(newswap);
+    if (next == newswap || swapfiles[next].size) break;
+    newswap = next;
+    snprintf(file, sizeof(file), "%d", newswap);
+  }
+  if (unlikely(!usable))
+  {
+    // A mapping we cannot remove, or no usable slot.  Try again next time.
+    request_diet();
+    return false;
+  }
+
   // We can allocate another swapfile.  Great.
 #ifndef NO_CONFIG
   if (!quiet) logm(LOG_NOTICE, "Allocating swapfile '%d'", newswap);
 #endif
-  char file[30];
-  snprintf(file, sizeof(file), "%d", newswap);
-  swapfiles[newswap].size = make_swapfile(file, size);
+  swapfiles[newswap].size = make_swapfile(file, size, crypt);
   if (unlikely(!swapfiles[newswap].size))
   {
     request_diet();
@@ -1062,11 +1158,31 @@ bool alloc_swapfile(memsize_t size)
   }
 
   int err = 0;
-  if (unlikely(!enable_swapfile(file, &err)))
+  bool enabled, held = false;
+  if (crypt)
   {
-    unlink(file);
+    // Never falls back to enabling the plain file.
+    const enum crypt_result result = crypt_enable(newswap, file);
+    enabled = result == CRYPT_OK;
+    held = result == CRYPT_HELD;
+  }
+  else
+  {
+    enabled = enable_swapfile(file, &err);
+  }
+
+  if (unlikely(!enabled))
+  {
+    /* A mapping that could not be removed still holds the file through its
+     * loop device.  Keep the file, as retiring does; the leftover is removed
+     * the next time this slot is used, or at the next startup.
+     */
+    if (unlikely(held))
+      logm(LOG_NOTICE, "Keeping swapfile '%d': a mapping still holds it", newswap);
+    else
+      unlink(file);
     swapfiles[newswap].size = 0;
-    if (pfalloc_ok && err == EINVAL)
+    if (!crypt && pfalloc_ok && err == EINVAL)
     {
       logm(LOG_NOTICE, "Quick swapfile creation disabled.");
       // If we get EINVAL, then we can't actually use posix_fallocate
@@ -1083,6 +1199,7 @@ bool alloc_swapfile(memsize_t size)
 
   swapfiles[newswap].created = runclock;
   swapfiles[newswap].used = 0;
+  swapfiles[newswap].crypt = crypt;
   sequence_number = inc_swapno(sequence_number);
 
   return true;

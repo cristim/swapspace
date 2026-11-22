@@ -1,9 +1,9 @@
-/* Tests for swaps.c that need no privileges.
+/* Tests for crypt mode in swaps.c that need no privileges.
  *
- * This includes the daemon's own swaps.c, so the real allocation, retirement
- * and startup code runs, against the in-memory fake system of
- * tests/fake_system.h (no loop devices, no cryptsetup, no real swapon) and a
- * fake /proc/swaps, all inside a temporary directory.
+ * This includes the daemon's own swaps.c, so the real allocation, adoption,
+ * retirement and startup code runs, against the in-memory fake system of
+ * tests/fake_system.h (no loop devices, no cryptsetup, no real swapon), a fake
+ * sysfs tree and a fake /proc/swaps, all inside a temporary directory.
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -22,6 +22,11 @@
 #include "../src/cryptdev.c"
 #include "fake_system.h"
 
+#include <sys/ioctl.h>
+#include <sys/vfs.h>
+#include <linux/fs.h>
+#include <linux/magic.h>
+
 /* Count the calls that decide how a swapfile is populated. */
 static int fallocate_calls = 0;
 static int fsync_calls = 0;
@@ -38,13 +43,44 @@ static int counting_fsync(int fd)
   return fsync(fd);
 }
 
+/* The filesystem of the swap directory is made to look like btrfs, with or
+ * without NOCOW on new files, so that the crypt-mode refusal can be tested.
+ */
+static bool fake_btrfs = false;
+static bool fake_nocow = true;
+
+static int fake_fstatfs(int fd, struct statfs *buf)
+{
+  const int r = fstatfs(fd, buf);
+  if (r == 0 && fake_btrfs) buf->f_type = BTRFS_SUPER_MAGIC;
+  return r;
+}
+
+static int fake_ioctl(int fd, unsigned long request, ...)
+{
+  va_list ap;
+  va_start(ap, request);
+  void *const arg = va_arg(ap, void *);
+  va_end(ap);
+  if (fake_btrfs && request == FS_IOC_GETFLAGS)
+  {
+    *(int *)arg = fake_nocow ? FS_NOCOW_FL : 0;
+    return 0;
+  }
+  return ioctl(fd, request, arg);
+}
+
 #define posix_fallocate counting_fallocate
 #define fsync counting_fsync
+#define fstatfs fake_fstatfs
+#define ioctl fake_ioctl
 
 #include "../src/swaps.c"
 
 #undef posix_fallocate
 #undef fsync
+#undef fstatfs
+#undef ioctl
 
 /* Stand-ins for the globals and functions of the rest of the daemon. */
 char localbuf[16384];
@@ -146,7 +182,11 @@ static void reset(bool crypt)
   remove_numbered_files();
   memset(swapfiles, 0, sizeof(swapfiles));
   sequence_number = MAX_SWAPFILES - 1;	// so that the next slot used is 0
+  foreign_logged = 0;
   pfalloc_ok = true;
+  fake_btrfs = false;
+  fake_nocow = true;
+  fake_sysfs_clear();
   proc_swaps_read_ok = false;
   diets = 0;
   fallocate_calls = fsync_calls = 0;
@@ -177,6 +217,19 @@ static void make_file(const char name[], size_t bytes, char fill)
 
 static memsize_t page(void) { return getpagesize(); }
 
+/// Absolute path of swapfile n in the swap directory
+static const char *swapfile_path(int n)
+{
+  return fake_path("swap/%d", n);
+}
+
+/// A mapping swapspace-<n> exists, on a loop device backed by the given path
+static void add_mapping(int n, const char backing[])
+{
+  fake_sysfs_mapping(20 + n, n, 30 + n, backing);
+  fake.mapped |= 1u << n;
+}
+
 static bool all_bytes(const char name[], char value)
 {
   FILE *fp = fopen(name, "r");
@@ -186,6 +239,171 @@ static bool all_bytes(const char name[], char value)
   while ((c = fgetc(fp)) != EOF) if (c != (unsigned char)value) ok = false;
   fclose(fp);
   return ok;
+}
+
+
+static void test_alloc_crypt(void)
+{
+  // Success: zeros are written and flushed, not preallocated; only the mapper
+  // device is ever formatted and enabled.
+  reset(true);
+  CHECK(alloc_swapfile(8 * page()));
+  CHECK_LOG("attach;open;loopclose;mkswap;swapon");
+  CHECK(fake.plain_calls == 0);
+  CHECK(swapfiles[0].size >= 8 * page() && swapfiles[0].crypt);
+  CHECK(exists("0"));
+  CHECK(fallocate_calls == 0);
+  CHECK(fsync_calls >= 1);
+  CHECK(all_bytes("0", '\0'));
+  CHECK(fake.mapped == 1u && fake.swapped == 1u && fake.loops_open == 0);
+
+  // The same with crypt off preallocates and never touches the mapper.
+  reset(false);
+  CHECK(alloc_swapfile(8 * page()));
+  CHECK_LOG("plain-mkswap;plain-swapon");
+  CHECK(!swapfiles[0].crypt);
+#ifdef HAVE_PFALLOCATE
+  CHECK(fallocate_calls >= 1);
+#endif
+  CHECK(fake.mapped == 0 && fake.plain_swapped == 1);
+
+  /* After a switch from crypt to plain, a leftover mapping of ours that cannot
+   * be removed still holds file 0: plain mode must not unlink it, and uses the
+   * next slot instead.  A removable one is closed first, as in crypt mode.
+   */
+  reset(false);
+  make_file("0", 4 * page(), 'M');
+  add_mapping(0, swapfile_path(0));
+  fake.fail_close = true;
+  CHECK(!alloc_swapfile(8 * page()));
+  CHECK(all_bytes("0", 'M') && fake.mapped == 1u && diets >= 1);
+  CHECK(alloc_swapfile(8 * page()) && exists("1") && swapfiles[1].size);
+  CHECK(!swapfiles[0].size && all_bytes("0", 'M'));
+  reset(false);
+  make_file("0", 4 * page(), 'M');
+  add_mapping(0, swapfile_path(0));
+  CHECK(alloc_swapfile(8 * page()) && fake.mapped == 0);
+  CHECK_LOG("close;plain-mkswap;plain-swapon");
+
+  // Each failure point: no swap is left, no plain swapon ever happens, the
+  // file is deleted, and the daemon asks for a diet.
+  struct { const char *name; bool *knob; const char *log; } cases[] =
+  {
+    { "attach", &fake.fail_attach, "attach" },
+    { "open", &fake.fail_open, "attach;open;loopclose" },
+    { "mkswap", &fake.fail_mkswap, "attach;open;loopclose;mkswap;close" },
+    { "swapon", &fake.fail_swapon,
+      "attach;open;loopclose;mkswap;swapon;close" },
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); ++i)
+  {
+    reset(true);
+    *cases[i].knob = true;
+    CHECK(!alloc_swapfile(8 * page()));
+    if (strcmp(fake.log, cases[i].log) != 0)
+    {
+      fprintf(stderr, "FAIL %s failure: log '%s', expected '%s'\n",
+	  cases[i].name, fake.log, cases[i].log);
+      ++failures;
+    }
+    CHECK(fake.plain_calls == 0 && fake.plain_swapped == 0);
+    CHECK(fake.mapped == 0 && fake.swapped == 0 && fake.loops_open == 0);
+    CHECK(!exists("0"));
+    CHECK(swapfiles[0].size == 0 && !swapfiles[0].crypt);
+    CHECK(diets >= 1);
+  }
+
+  // cryptsetup failing half-way leaves a mapping that must be removed.
+  reset(true);
+  fake.fail_open = fake.open_leaves_mapping = true;
+  CHECK(!alloc_swapfile(8 * page()));
+  CHECK_LOG("attach;open;close;loopclose");
+  CHECK(fake.mapped == 0 && !exists("0") && fake.plain_calls == 0);
+
+  // A mapping that cannot be removed still holds the file: keep the file.
+  reset(true);
+  fake.fail_swapon = fake.fail_close = true;
+  CHECK(!alloc_swapfile(8 * page()));
+  CHECK(exists("0"));
+  CHECK(fake.mapped == 1u && fake.plain_calls == 0);
+  CHECK(swapfiles[0].size == 0);
+
+  reset(true);
+  fake.fail_open = fake.open_leaves_mapping = fake.fail_close = true;
+  CHECK(!alloc_swapfile(8 * page()));
+  CHECK(exists("0"));
+  CHECK(fake.mapped == 1u && fake.plain_calls == 0);
+
+  // The next attempt on that slot removes the leftover first, then works.
+  add_mapping(0, swapfile_path(0));
+  fake.fail_open = fake.open_leaves_mapping = fake.fail_close = false;
+  fake.log[0] = '\0';
+  CHECK(alloc_swapfile(8 * page()));
+  CHECK_LOG("close;attach;open;loopclose;mkswap;swapon");
+  CHECK(fake.mapped == 1u && fake.swapped == 1u);
+  CHECK(swapfiles[0].crypt);
+
+  // A leftover mapping of ours that cannot be removed blocks the slot: nothing
+  // is created, and nothing is enabled.
+  reset(true);
+  make_file("0", 4 * page(), '\0');
+  add_mapping(0, swapfile_path(0));
+  fake.fail_close = true;
+  CHECK(!alloc_swapfile(8 * page()));
+  CHECK_LOG("close");
+  CHECK(exists("0") && fake.plain_calls == 0 && diets >= 1);
+  CHECK(fake.mapped == 1u);
+
+  // A mapping of that name that is not ours (another instance's, on a file
+  // elsewhere) is never closed: its slot number is skipped.
+  reset(true);
+  fake_mkdirs("elsewhere");
+  fake_write("data", "elsewhere/0");
+  add_mapping(0, fake_path("elsewhere/0"));
+  CHECK(alloc_swapfile(8 * page()));
+  CHECK_LOG("attach;open;loopclose;mkswap;swapon");
+  CHECK(fake.mapped == 3u && fake.swapped == 2u);	// theirs untouched, ours is 1
+  CHECK(swapfiles[1].crypt && swapfiles[0].size == 0 && !exists("0"));
+  CHECK(exists("1") && diets == 0);
+  CHECK(strstr(logtext, "Ignoring mapping swapspace-0") != NULL);
+
+  // ... also when it is the only slot left: nothing is created.
+  reset(true);
+  add_mapping(0, fake_path("elsewhere/0"));
+  for (int i = 1; i < MAX_SWAPFILES; ++i) swapfiles[i].size = 1;
+  CHECK(!alloc_swapfile(8 * page()));
+  CHECK_LOG("");
+  CHECK(fake.mapped == 1u && !exists("0") && diets >= 1);
+  memset(swapfiles, 0, sizeof(swapfiles));
+
+  // On btrfs a file without NOCOW would bounce direct writes through freshly
+  // allocated pages: crypt mode refuses to create it.  Plain mode, and a
+  // filesystem that does keep NOCOW, are not affected.
+  reset(true);
+  fake_btrfs = true;
+  fake_nocow = false;
+  CHECK(!alloc_swapfile(8 * page()));
+  CHECK_LOG("");
+  CHECK(!exists("0") && swapfiles[0].size == 0 && diets >= 1);
+  CHECK(strstr(logtext, "Refusing to create encrypted swapfile") != NULL);
+
+  reset(true);
+  fake_btrfs = true;
+  CHECK(alloc_swapfile(8 * page()));
+  CHECK(swapfiles[0].crypt);
+
+  reset(false);
+  fake_btrfs = true;
+  fake_nocow = false;
+  CHECK(alloc_swapfile(8 * page()));
+  CHECK(!swapfiles[0].crypt);
+
+  // Crypt mode never retries the plain way: its swapon is on the mapper device.
+  reset(true);
+  fake.fail_swapon = true;
+  CHECK(!alloc_swapfile(8 * page()));
+  CHECK_LOG("attach;open;loopclose;mkswap;swapon;close");
+  CHECK(pfalloc_ok);
 }
 
 
@@ -346,6 +564,7 @@ int main(void)
   min_swapsize = 4 * page();
   max_swapsize = 256 * page();
 
+  test_alloc_crypt();
   test_retire_plain();
   test_plain_einval();
   test_dump_stats();
