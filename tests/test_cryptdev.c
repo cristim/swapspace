@@ -1,10 +1,11 @@
-/* Tests for the sysfs lookups of crypt mode, which need no privileges.
+/* Tests for the system-facing crypt code that need no privileges.
  *
- * A fake sysfs tree in a scratch directory stands in for /sys (the tests point
- * crypt_sysfs_root at it), so finding mappings by name, recognizing the entries
- * of /proc/swaps, and proving that a mapping sits on our file can be checked
- * with every way a mapping can fail to be ours.  The fake system of
- * tests/fake_system.h is used by the tests that follow.
+ * Two kinds of fakes are used.  The swap_ops table is replaced by an in-memory
+ * system (tests/fake_system.h) that can fail at every step, so the fail-closed
+ * ordering and the teardown are checked for each failure point.  Separately,
+ * cryptsetup is replaced by a script on PATH to check the command lines
+ * through the real table.  The loop device ioctls need root and are covered by
+ * tests/crypt-root.sh instead.
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -55,7 +56,317 @@ static int failures = 0;
     } \
   } while (0)
 
+/// The event log must be exactly this
+#define CHECK_LOG(expected) \
+  do \
+  { \
+    if (strcmp(fake.log, (expected)) != 0) \
+    { \
+      fprintf(stderr, "FAIL %s:%d: log is '%s', expected '%s'\n", __FILE__, \
+	  __LINE__, fake.log, (expected)); \
+      ++failures; \
+    } \
+  } while (0)
+
+/// After a failure that was undone: nothing acquired is left, nothing enabled
+#define CHECK_CLEAN() \
+  do \
+  { \
+    CHECK(fake.loops_open == 0); \
+    CHECK(fake.mapped == 0); \
+    CHECK(fake.swapped == 0); \
+    CHECK(fake.plain_calls == 0); \
+  } while (0)
+
+
 static const struct swap_ops *real_ops_table;
+
+static void use_fake(void)
+{
+  fake_reset();
+  swapops = &fake_ops;
+}
+
+
+/// crypt_enable() against the fake system, for each failure point
+static void test_enable(void)
+{
+  const char *const file = "5";
+  use_fake();
+
+  // Success: the whole chain, in this order, on the mapper device only.
+  CHECK(crypt_enable(5, file) == CRYPT_OK);
+  CHECK_LOG("attach;open;loopclose;mkswap;swapon");
+  CHECK(fake.mapped == 1u << 5 && fake.swapped == 1u << 5);
+  CHECK(fake.loops_open == 0 && fake.plain_calls == 0);
+
+  // The slot is taken now: a second attempt must not touch anything.
+  use_fake();
+  fake.mapped = 1u << 5;
+  CHECK(crypt_enable(5, file) == CRYPT_FAILED);
+  CHECK_LOG("");
+
+  // Loop device cannot be attached: nothing else may run.
+  use_fake();
+  fake.fail_attach = true;
+  CHECK(crypt_enable(5, file) == CRYPT_FAILED);
+  CHECK_LOG("attach");
+  CHECK_CLEAN();
+
+  // Invalid key size for the cipher: the loop device is released again.
+  use_fake();
+  {
+    const int saved = crypt_keysize;
+    crypt_keysize = 128;	// not valid for xts
+    CHECK(crypt_enable(5, file) == CRYPT_FAILED);
+    crypt_keysize = saved;
+  }
+  CHECK_LOG("attach;loopclose");
+  CHECK_CLEAN();
+
+  // cryptsetup open fails without creating a mapping: loop released, no close.
+  use_fake();
+  fake.fail_open = true;
+  CHECK(crypt_enable(5, file) == CRYPT_FAILED);
+  CHECK_LOG("attach;open;loopclose");
+  CHECK_CLEAN();
+
+  // cryptsetup open fails half-way and leaves a mapping: it is removed before
+  // the loop descriptor is released.
+  use_fake();
+  fake.fail_open = fake.open_leaves_mapping = true;
+  CHECK(crypt_enable(5, file) == CRYPT_FAILED);
+  CHECK_LOG("attach;open;close;loopclose");
+  CHECK_CLEAN();
+
+  // ... and if that mapping cannot be removed, the caller is told it still
+  // holds the file.
+  use_fake();
+  fake.fail_open = fake.open_leaves_mapping = fake.fail_close = true;
+  CHECK(crypt_enable(5, file) == CRYPT_HELD);
+  CHECK_LOG("attach;open;close;loopclose");
+  CHECK(fake.mapped == 1u << 5 && fake.loops_open == 0 && fake.swapped == 0);
+  CHECK(fake.plain_calls == 0);
+
+  // mkswap fails: swapon is never attempted, the mapping is removed.
+  use_fake();
+  fake.fail_mkswap = true;
+  CHECK(crypt_enable(5, file) == CRYPT_FAILED);
+  CHECK_LOG("attach;open;loopclose;mkswap;close");
+  CHECK_CLEAN();
+
+  // swapon fails: the mapping is removed, and no plain swapon follows.
+  use_fake();
+  fake.fail_swapon = true;
+  CHECK(crypt_enable(5, file) == CRYPT_FAILED);
+  CHECK_LOG("attach;open;loopclose;mkswap;swapon;close");
+  CHECK_CLEAN();
+
+  // Failed teardown after mkswap or swapon is reported as HELD.
+  use_fake();
+  fake.fail_mkswap = fake.fail_close = true;
+  CHECK(crypt_enable(5, file) == CRYPT_HELD);
+  CHECK_LOG("attach;open;loopclose;mkswap;close");
+  CHECK(fake.mapped == 1u << 5 && fake.swapped == 0 && fake.plain_calls == 0);
+
+  use_fake();
+  fake.fail_swapon = fake.fail_close = true;
+  CHECK(crypt_enable(5, file) == CRYPT_HELD);
+  CHECK_LOG("attach;open;loopclose;mkswap;swapon;close");
+  CHECK(fake.mapped == 1u << 5 && fake.swapped == 0 && fake.plain_calls == 0);
+
+  // Slot numbers up to the limit work and are the ones passed on.
+  use_fake();
+  CHECK(crypt_enable(31, "31") == CRYPT_OK);
+  CHECK(fake.mapped == 1u << 31 && fake.swapped == 1u << 31);
+  CHECK(crypt_enable(-1, "x") == CRYPT_FAILED);
+}
+
+
+/// crypt_retire(), crypt_unmap() and crypt_clear_stale()
+static void test_teardown(void)
+{
+  use_fake();
+  CHECK(crypt_enable(2, "2") == CRYPT_OK);
+
+  // swapoff first, then the mapping.
+  fake.log[0] = '\0';
+  CHECK(crypt_retire(2));
+  CHECK_LOG("swapoff;close");
+  CHECK(fake.mapped == 0 && fake.swapped == 0);
+
+  // If swapoff fails the mapping must stay: it is still in use.
+  use_fake();
+  CHECK(crypt_enable(2, "2") == CRYPT_OK);
+  fake.log[0] = '\0';
+  fake.fail_swapoff = true;
+  CHECK(!crypt_retire(2));
+  CHECK_LOG("swapoff");
+  CHECK(fake.mapped == 1u << 2 && fake.swapped == 1u << 2);
+
+  // swapoff works but the mapping cannot be removed: reported.
+  use_fake();
+  CHECK(crypt_enable(2, "2") == CRYPT_OK);
+  fake.log[0] = '\0';
+  fake.fail_close = true;
+  CHECK(!crypt_retire(2));
+  CHECK_LOG("swapoff;close");
+
+  CHECK(!crypt_retire(-1));
+
+  // Mapping names are global: only a mapping on our file is removed.  The fake
+  // sysfs says whose it is.
+  static char sys[1024];
+  snprintf(sys, sizeof(sys), "%s", fake_path("sys"));
+  crypt_sysfs_root = sys;
+  fake_mkdirs("swap");
+  fake_write("data", "swap/3");
+  fake_write("data", "swap/4");
+
+  // No mapping means nothing to do.
+  use_fake();
+  fake_sysfs_clear();
+  CHECK(crypt_clear_stale(3, "swap/3") == CRYPT_SLOT_FREE);
+  CHECK_LOG("");
+
+  // A stale mapping of ours is removed.
+  use_fake();
+  fake_sysfs_mapping(3, 3, 8, fake_path("swap/3"));
+  fake.mapped = 1u << 3;
+  CHECK(crypt_clear_stale(3, "swap/3") == CRYPT_SLOT_FREE);
+  CHECK_LOG("close");
+  CHECK(fake.mapped == 0);
+
+  // One that cannot be removed must be reported as such.
+  use_fake();
+  fake.mapped = 1u << 3;
+  fake.fail_close = true;
+  CHECK(crypt_clear_stale(3, "swap/3") == CRYPT_SLOT_HELD);
+  CHECK_LOG("close");
+  CHECK(fake.mapped == 1u << 3);
+
+  // One that is busy (active swap) cannot be removed either.
+  use_fake();
+  fake.mapped = fake.swapped = 1u << 3;
+  CHECK(crypt_clear_stale(3, "swap/3") == CRYPT_SLOT_HELD);
+
+  // A mapping on another file (another instance's) is left alone: no close,
+  // whatever else is true of it.
+  use_fake();
+  fake.mapped = 1u << 3;
+  CHECK(crypt_clear_stale(3, "swap/4") == CRYPT_SLOT_FOREIGN);
+  CHECK_LOG("");
+  CHECK(fake.mapped == 1u << 3);
+
+  // So is one whose ownership cannot be established: no sysfs entry at all, or
+  // our file not existing.
+  use_fake();
+  fake_sysfs_clear();
+  fake.mapped = 1u << 3;
+  CHECK(crypt_clear_stale(3, "swap/3") == CRYPT_SLOT_FOREIGN);
+  fake_sysfs_mapping(3, 3, 8, fake_path("swap/3"));
+  CHECK(crypt_clear_stale(3, "swap/missing") == CRYPT_SLOT_FOREIGN);
+  CHECK_LOG("");
+  CHECK(fake.mapped == 1u << 3);
+  fake_sysfs_clear();
+  crypt_sysfs_root = "/sys";
+
+  // crypt_mapping_exists goes through the table.
+  use_fake();
+  CHECK(!crypt_mapping_exists(4));
+  fake.mapped = 1u << 4;
+  CHECK(crypt_mapping_exists(4));
+}
+
+
+/// The real table: cryptsetup is a script on PATH that logs its arguments
+static void test_real_table(const char logpath[])
+{
+  swapops = real_ops_table;
+
+  // runcommandline reports the exit status, and runs the line as given.
+  CHECK(runcommandline("exit 0") == 0);
+  CHECK(runcommandline("exit 3") == 3);
+  CHECK(runcommandline("kill -9 $$") == -1);
+
+  // Removing a mapping runs "cryptsetup close swapspace-N".
+  setenv("FAKE_RC", "0", 1);
+  unlink(logpath);
+  CHECK(crypt_unmap(4));
+  CHECK(strcmp(fake_text(logpath), "close swapspace-4\n") == 0);
+
+  setenv("FAKE_RC", "5", 1);
+  unlink(logpath);
+  CHECK(!crypt_unmap(4));
+  CHECK(strcmp(fake_text(logpath), "close swapspace-4\n") == 0);
+  CHECK(!crypt_unmap(-1));
+
+  // A file that does not exist fails before any loop or cryptsetup step, and
+  // the file argument cannot inject anything.  The real loop device code is
+  // only reachable with root (see crypt-root.sh).
+  setenv("FAKE_RC", "1", 1);
+  unlink(logpath);
+  CHECK(crypt_map_file("no/such/file; touch pwned", 27) == CRYPT_FAILED);
+  CHECK(strstr(fake_text(logpath), "open") == NULL);
+}
+
+
+/// What the loop device is asked for, from the hints a filesystem gives
+#ifdef LOOP_CONFIGURE
+static void test_loop_request(void)
+{
+  struct loop_config cfg;
+
+  // Alignment 4096 (4Kn storage) must give 4096, 512 must give 512: a request
+  // that always said 512 would be refused by the kernel on 4Kn devices.
+  memset(&cfg, 0xff, sizeof(cfg));
+  CHECK(loop_request(&cfg, 17, 4096, 512, 4096));
+  CHECK(cfg.fd == 17 && cfg.block_size == 4096);
+  CHECK(cfg.info.lo_flags & LO_FLAGS_AUTOCLEAR);
+  CHECK(cfg.info.lo_flags & LO_FLAGS_DIRECT_IO);
+  CHECK(!(cfg.info.lo_flags & LO_FLAGS_READ_ONLY));
+  CHECK(cfg.info.lo_offset == 0 && cfg.info.lo_sizelimit == 0);
+
+  CHECK(loop_request(&cfg, 17, 512, 4096, 4096));
+  CHECK(cfg.block_size == 512);
+  loop_request(&cfg, 17, 0, 4096, 4096);	// only the preferred size known
+  CHECK(cfg.block_size == 4096);
+  loop_request(&cfg, 17, 0, 0, 4096);
+  CHECK(cfg.block_size == 512);
+  loop_request(&cfg, 17, 4096, 0, 16384);	// 16 KiB pages (Asahi)
+  CHECK(cfg.block_size == 4096);
+  loop_request(&cfg, 17, 0, 1048576, 4096);	// a large preferred size is capped
+  CHECK(cfg.block_size == 4096);
+  /* An alignment above the page size cannot be met.  Passing block_size 0 on
+   * would make the kernel use the alignment as the block size and keep direct
+   * I/O, so the request itself is refused.
+   */
+  CHECK(!loop_request(&cfg, 17, 8192, 0, 4096));
+  CHECK(!loop_request(&cfg, 17, 65536, 4096, 16384));
+
+  struct loop_info64 info;
+  memset(&info, 0, sizeof(info));
+  CHECK(!loop_dio_active(&info));
+  info.lo_flags = LO_FLAGS_AUTOCLEAR;
+  CHECK(!loop_dio_active(&info));
+  info.lo_flags = LO_FLAGS_AUTOCLEAR | LO_FLAGS_DIRECT_IO;
+  CHECK(loop_dio_active(&info));
+
+  // The hints of a real open file are sane, whatever the filesystem says.
+  fake_write("x", "hints-probe");
+  const int fd = open(fake_path("hints-probe"), O_RDONLY);
+  unsigned long dio = 99, blk = 99;
+  CHECK(fd != -1);
+  io_hints(fd, &dio, &blk);
+  close(fd);
+  CHECK(dio == 0 || (dio & (dio - 1)) == 0);
+  CHECK(blk > 0 && blk != 99);
+  io_hints(-1, &dio, &blk);
+  CHECK(dio == 0 && blk == 0);
+}
+#else
+static void test_loop_request(void) { }
+#endif
 
 
 /// Fake sysfs: finding mappings, the slot of a /proc/swaps entry, and whether
@@ -224,10 +535,28 @@ int main(void)
   fake_dir_create("swapspace-cryptdev");
   real_ops_table = swapops;
 
+  // Fake cryptsetup first on PATH; it logs its arguments and exits $FAKE_RC.
+  fake_write("#!/bin/sh\necho \"$@\" >> \"$FAKE_LOG\"\nexit \"${FAKE_RC:-0}\"\n",
+      "cryptsetup");
+  chmod(fake_path("cryptsetup"), 0755);
+  const char *const oldpath = getenv("PATH");
+  char path[PATH_MAX + 512];
+  snprintf(path, sizeof(path), "%s:%s", fake_dir,
+      oldpath ? oldpath : "/usr/bin:/bin");
+  setenv("PATH", path, 1);
+  const char *const logpath = fake_path("log");
+  setenv("FAKE_LOG", logpath, 1);
+
+  // Failed attempts to run the scripts must not leave stray files in the
+  // working directory.
   char cwd[PATH_MAX];
   if (!getcwd(cwd, sizeof(cwd))) { perror("getcwd"); return 2; }
   if (chdir(fake_dir) != 0) { perror("chdir"); return 2; }
 
+  test_real_table(logpath);
+  test_enable();
+  test_teardown();
+  test_loop_request();
   test_sysfs();
   test_names();
 
