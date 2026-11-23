@@ -303,8 +303,6 @@ struct Swapfile
   bool observed_in_wild;
 };
 
-static int sequence_number = 0;
-
 /// Power-of-two defining how many active swapfiles to support
 /** Since swapspace allocates swapfiles of increasing sizes, there is probably
  * little need for a large number of swapfile slots.
@@ -352,13 +350,6 @@ void dump_stats(void)
   }
 }
 
-
-
-/// Return next swapfile number after i
-static inline int inc_swapno(int i)
-{
-  return (i+1) % MAX_SWAPFILES;
-}
 
 
 /// Get filesystem info for swapdir, but retry once if interrupted by signal
@@ -895,8 +886,11 @@ static bool retire_swapfile(int file)
    * filename, if we are able to delete the file then we won't be able to
    * deactivate it without disabling swapping altogether.
    *
-   * Finally, we also need to avoid reusing names of deleted swapfiles while
-   * they are still in use or things would get horribly confused.
+   * A retired name may be reused at once: the file is unlinked only after
+   * libc swapoff() succeeded, and any paranoid wipe runs synchronously
+   * through the open descriptor.  A failed libc swapoff() leaves the slot
+   * marked as taken.  The fallback swapoff() in support.c does not report
+   * failure as -1, which predates this change.
    */
   char namebuf[30];
   snprintf(namebuf, sizeof(namebuf), "%d", file);
@@ -966,18 +960,6 @@ bool retire_all(void)
 }
 
 
-/// Find a free swapfile slot, or return last if none available
-static int find_free(int last)
-{
-  assert(last >= 0);
-  assert(last < MAX_SWAPFILES);
-  int i;
-  for (i = last+1; i < MAX_SWAPFILES && swapfiles[i].size; ++i);
-  if (i >= MAX_SWAPFILES) for (i = 0; i < last && swapfiles[i].size; ++i);
-  return i;
-}
-
-
 bool alloc_swapfile(memsize_t size)
 {
   /* Round request to page size, then add a bit for swapfile overhead.  Clever
@@ -998,8 +980,10 @@ bool alloc_swapfile(memsize_t size)
    */
   if (unlikely(size > max_swapsize)) size = max_swapsize;
 
-  const int newswap = find_free(sequence_number);
-  if (unlikely(swapfiles[newswap].size))
+  memsize_t sizes[MAX_SWAPFILES];
+  for (int i=0; i<MAX_SWAPFILES; ++i) sizes[i] = swapfiles[i].size;
+  const int newswap = lowest_free_slot(sizes, MAX_SWAPFILES);
+  if (unlikely(newswap < 0))
   {
     // No free slot.  Turn to "diet" policy instead of retrying every second.
     request_diet();
@@ -1048,7 +1032,6 @@ bool alloc_swapfile(memsize_t size)
 
   swapfiles[newswap].created = runclock;
   swapfiles[newswap].used = 0;
-  sequence_number = inc_swapno(sequence_number);
 
   return true;
 }

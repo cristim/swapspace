@@ -42,6 +42,13 @@ log debug information to the system's daemon log and/or standard output, as
 appropriate.  The program can also be made to log state transitions by starting
 it with the -v or --verbose option.
 
+Swapfile slots
+--------------
+
+Swapfiles are named by slot number, 0 to 31.  A new swapfile always takes the
+lowest free slot, so a freed low slot is reused before a higher one.  Which
+file is retired is decided by size, not slot number.
+
 External signals
 ----------------
 

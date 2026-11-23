@@ -81,6 +81,26 @@ int main(void)
   // values near LLONG_MAX.
   CHECK(parse_cgroup_limit("9223372036854771712\n", &cg));
 
+  // Lowest free swapfile slot.
+  {
+    memsize_t slots[4] = { 0, 0, 0, 0 };
+    CHECK(lowest_free_slot(slots, 4) == 0);
+    slots[0] = 1;
+    CHECK(lowest_free_slot(slots, 4) == 1);
+    slots[1] = slots[3] = 1;
+    CHECK(lowest_free_slot(slots, 4) == 2);
+    slots[2] = 1;
+    CHECK(lowest_free_slot(slots, 4) == -1);
+    slots[0] = 0;
+    CHECK(lowest_free_slot(slots, 4) == 0);
+    // Only the first n entries count: the slot at index n is a sentinel.
+    slots[3] = 0;
+    CHECK(lowest_free_slot(slots, 3) == 0);
+    slots[0] = 1;
+    CHECK(lowest_free_slot(slots, 3) == -1);
+    CHECK(lowest_free_slot(slots, 0) == -1);
+  }
+
   if (failures) fprintf(stderr, "%d check(s) failed\n", failures);
   return failures ? 1 : 0;
 }

@@ -49,4 +49,10 @@ bool parse_psi_line(const char line[], int *percent);
 /** @return false for "max", negative values, or malformed input */
 bool parse_cgroup_limit(const char text[], memsize_t *limit);
 
+/// Index of the first zero entry in sizes[0..n), or -1 if every slot is taken
+/** Swapfiles are numbered by slot; always using the lowest free one makes
+ * lower-numbered files fill first once priorities follow slot order.
+ */
+int lowest_free_slot(const memsize_t sizes[], int n);
+
 #endif

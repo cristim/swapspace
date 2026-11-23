@@ -42,6 +42,13 @@ memsize_t ext_to_page(memsize_t n)
 }
 
 
+int lowest_free_slot(const memsize_t sizes[], int n)
+{
+  for (int i=0; i<n; ++i) if (!sizes[i]) return i;
+  return -1;
+}
+
+
 memsize_t ideal_swapsize(memsize_t totalspace, memsize_t freespace,
     int freetarget)
 {
