@@ -71,6 +71,13 @@ static char swappath[PATH_MAX] = VARPREFIX"/lib/swapspace";
 static size_t swappath_len;
 
 
+/// Power-of-two defining how many active swapfiles to support
+/** Since swapspace allocates swapfiles of increasing sizes, there is probably
+ * little need for a large number of swapfile slots.
+ */
+#define MAXSWAPS_SHIFT 5
+#define MAX_SWAPFILES (1 << MAXSWAPS_SHIFT)
+
 /// Smallest allowed swapfile size
 static memsize_t min_swapsize = 4*MEGA;
 /// Largest allowed swapfile size
@@ -79,7 +86,15 @@ static memsize_t min_swapsize = 4*MEGA;
  */
 static memsize_t max_swapsize = 2*TERA;
 
+/// Swap priority of slot 0, or 0 to let the kernel choose
+static int file_priority = 0;
+
 #ifndef NO_CONFIG
+char *set_file_priority(long long priority)
+{
+  file_priority = (int)priority;
+  return NULL;
+}
 char *set_swappath(long long dummy)
 {
   return swappath;
@@ -109,6 +124,16 @@ bool swaps_check_config(void)
 {
   CHECK_CONFIG_ERR(min_swapsize > max_swapsize);
   CHECK_CONFIG_ERR(min_swapsize < 10*getpagesize());
+
+  if (!valid_file_priority(file_priority, MAX_SWAPFILES))
+  {
+    logm(LOG_ERR,
+	"file_priority must be 0 or between %d and %d, not %d",
+	MAX_SWAPFILES-1,
+	MAX_FILE_PRIORITY,
+	file_priority);
+    return false;
+  }
 
   if (swappath[0] != '/')
   {
@@ -303,13 +328,6 @@ struct Swapfile
   bool observed_in_wild;
 };
 
-/// Power-of-two defining how many active swapfiles to support
-/** Since swapspace allocates swapfiles of increasing sizes, there is probably
- * little need for a large number of swapfile slots.
- */
-#define MAXSWAPS_SHIFT 5
-#define MAX_SWAPFILES (1 << MAXSWAPS_SHIFT)
-
 /// Array of swapfile descriptors
 /** The last element remains zeroed for use as a sentry.
  */
@@ -402,18 +420,19 @@ memsize_t swapfs_size(void)
 
 /// Turn an existing file into an active swap.  Clobbers localbuf.
 /**
+ * @param slot swapfile number, which determines the swap priority
  * @param fault if not NULL, receives the errno value from a failed swapon(),
  *        or zero on success.  Logging may clobber errno, so callers must not
  *        rely on errno after this call.
  * @return Whether file was activated successfully.
  */
-static bool enable_swapfile(const char file[], int *fault)
+static bool enable_swapfile(const char file[], int slot, int *fault)
 {
   const int mkstatus = runcommand("mkswap", file);
   if (unlikely(mkstatus != 0))
     logm(LOG_WARNING, "mkswap failed for '%s' (status %d)", file, mkstatus);
 
-  if (unlikely(swapon(file, 0) != 0))
+  if (unlikely(swapon(file, swapon_flags(file_priority, slot)) != 0))
   {
     const int err = errno;
     if (fault) *fault = err;
@@ -677,7 +696,8 @@ bool activate_old_swaps(void)
       }
 
       int err = 0;
-      if (likely(size >= min_swapsize && enable_swapfile(d->d_name, &err)))
+      if (likely(size >= min_swapsize &&
+	    enable_swapfile(d->d_name, seqno, &err)))
       {
 	swapfiles[seqno].size = size;
       }
@@ -1011,7 +1031,7 @@ bool alloc_swapfile(memsize_t size)
   }
 
   int err = 0;
-  if (unlikely(!enable_swapfile(file, &err)))
+  if (unlikely(!enable_swapfile(file, newswap, &err)))
   {
     unlink(file);
     swapfiles[newswap].size = 0;

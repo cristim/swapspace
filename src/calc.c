@@ -49,6 +49,21 @@ int lowest_free_slot(const memsize_t sizes[], int n)
 }
 
 
+bool valid_file_priority(int file_priority, int nslots)
+{
+  return file_priority == 0 ||
+    (file_priority >= nslots-1 && file_priority <= MAX_FILE_PRIORITY);
+}
+
+
+int swapon_flags(int file_priority, int slot)
+{
+  if (!file_priority) return 0;
+  return SWAP_FLAG_PREFER |
+    (((file_priority - slot) << SWAP_FLAG_PRIO_SHIFT) & SWAP_FLAG_PRIO_MASK);
+}
+
+
 memsize_t ideal_swapsize(memsize_t totalspace, memsize_t freespace,
     int freetarget)
 {

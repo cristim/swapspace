@@ -49,6 +49,19 @@ Swapfiles are named by slot number, 0 to 31.  A new swapfile always takes the
 lowest free slot, so a freed low slot is reused before a higher one.  Which
 file is retired is decided by size, not slot number.
 
+With `file_priority` set to P, slot n is enabled with swap priority P-n, so the
+kernel uses lower slots first.  That is slot order, not creation order: a freed
+low slot is reused, so the newest file can be the fullest.  Retirement does not
+use the slot order.  P is 0 (kernel default: recent kernels give all files one
+priority and spread usage evenly, older ones give each a lower automatic
+priority and fill them in activation order) or 31 to 32767, so no priority goes
+negative.  Explicit priorities outrank swap areas with automatic priority.
+zram is typically 100: a P below 100 keeps swapfiles after zram, 100 to 131
+makes some slots share priority 100 with it (the kernel alternates between
+equal priorities), and 132 or more keeps every swapfile above it.  The priority
+is applied when swapspace enables a file, including old files it re-enables at
+startup.
+
 External signals
 ----------------
 

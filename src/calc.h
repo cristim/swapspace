@@ -22,6 +22,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #ifndef SWAPSPACE_CALC_H
 #define SWAPSPACE_CALC_H
 
+#include <sys/swap.h>
+
 #include "memory.h"
 
 /// Truncate n to a multiple of memory page size
@@ -54,5 +56,20 @@ bool parse_cgroup_limit(const char text[], memsize_t *limit);
  * lower-numbered files fill first once priorities follow slot order.
  */
 int lowest_free_slot(const memsize_t sizes[], int n);
+
+/// Highest priority the kernel accepts for a swap area
+#define MAX_FILE_PRIORITY SWAP_FLAG_PRIO_MASK
+
+/// Is file_priority a usable setting for nslots swapfile slots?
+/** Zero means "let the kernel choose".  Otherwise slot 0 gets that priority and
+ * slot n gets n less, which must not go negative for the last slot.
+ */
+bool valid_file_priority(int file_priority, int nslots);
+
+/// swapon() flags for the swapfile in the given slot
+/** Zero (kernel-chosen priority) if file_priority is zero; otherwise an
+ * explicit priority of file_priority-slot.
+ */
+int swapon_flags(int file_priority, int slot);
 
 #endif
