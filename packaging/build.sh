@@ -150,7 +150,21 @@ build_arch() {
   publish "$dir"/out/swapspace-*.pkg.tar.*
 }
 
-build_deb() { die "deb packaging is not implemented yet"; }
+build_deb() {
+  local dir="$work/deb" upstream="${base}+git${count}.${sha}"
+  local src="$dir/swapspace-$srcver"
+  mkdir -p "$dir"
+  tar -xzf "$tarball" -C "$dir"
+  cp "$tarball" "$dir/swapspace_$upstream.orig.tar.gz"
+  cp -a "$here/debian" "$src/debian"
+  cp "$here/swapspace.tmpfiles" "$src/debian/swapspace-tmpfiles.conf"
+  sed -e "s|@VERSION@|$upstream-1|" -e "s|@SHA@|$sha|" \
+    -e "s|@DATE@|$(date -R -u -d "@$commit_time")|" \
+    "$here/debian/changelog.tmpl" > "$src/debian/changelog"
+  rm "$src/debian/changelog.tmpl"
+  (cd "$src" && dpkg-buildpackage -us -uc -b)
+  publish "$dir"/swapspace_*.deb
+}
 build_rpm() { die "rpm packaging is not implemented yet"; }
 
 "build_$target"
