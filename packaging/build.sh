@@ -165,6 +165,18 @@ build_deb() {
   (cd "$src" && dpkg-buildpackage -us -uc -b)
   publish "$dir"/swapspace_*.deb
 }
-build_rpm() { die "rpm packaging is not implemented yet"; }
+build_rpm() {
+  local top="$work/rpm"
+  mkdir -p "$top"/{SOURCES,SPECS,BUILD,RPMS,SRPMS,BUILDROOT}
+  cp "$tarball" "$here/swapspace.tmpfiles" "$top/SOURCES/"
+  cp "$here/rpm/swapspace.spec" "$top/SPECS/"
+  rpmbuild -bb "$top/SPECS/swapspace.spec" \
+    --define "_topdir $top" \
+    --define "pkg_version $base" \
+    --define "snap_count $count" \
+    --define "snap_sha $sha" \
+    --define "snap_date $(LC_ALL=C date -u -d "@$commit_time" '+%a %b %d %Y')"
+  publish "$top"/RPMS/*/swapspace-*.rpm
+}
 
 "build_$target"
